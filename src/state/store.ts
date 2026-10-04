@@ -3,6 +3,7 @@ import type {
   Doc,
   HistoryEntry,
   Layer,
+  PixelBuffer,
   Rect,
   ToolId,
 } from '../types';
@@ -24,7 +25,7 @@ import {
   docPatch,
   HISTORY_LIMIT,
 } from '../core/history';
-import { createPixelBuffer, clonePixelBuffer } from '../utils/pixels';
+import { blitBuffer, createPixelBuffer, clonePixelBuffer } from '../utils/pixels';
 
 export interface EditorUi {
   tool: ToolId;
@@ -84,6 +85,11 @@ export interface EditorState extends EditorUi {
   resize: (width: number, height: number) => void;
   setPalette: (colors: string[]) => void;
   setDocName: (name: string) => void;
+
+  /** Crée un nouveau document à partir de sprites générés (1 par image). */
+  newDocFromBuffers: (name: string, frames: PixelBuffer[], durationMs?: number) => void;
+  /** Ajoute un sprite généré comme nouveau calque (centré). */
+  addLayerFromBuffer: (buffer: PixelBuffer, name: string) => void;
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -474,6 +480,49 @@ export const useEditorStore = create<EditorState>()((set, get) => {
         doc: { ...state.doc, name: name.trim() || state.doc.name },
         docRev: state.docRev + 1,
       });
+    },
+
+    newDocFromBuffers: (name, frames, durationMs = 140) => {
+      const source = frames[0];
+      if (!source) return;
+      const doc = createDoc(
+        name.trim() || 'Sprite généré',
+        source.width,
+        source.height,
+      );
+      doc.frames = frames.map(() => ({ id: uid('frame'), durationMs }));
+      const layer = doc.layers[0];
+      if (layer.type === 'raster') {
+        layer.name = 'Sprite';
+        frames.forEach((buf, i) => {
+          layer.frames[i] = clonePixelBuffer(buf);
+        });
+      }
+      set({
+        doc,
+        docRev: get().docRev + 1,
+        undoStack: [],
+        redoStack: [],
+        ...initialUi(doc),
+      });
+    },
+
+    addLayerFromBuffer: (buffer, name) => {
+      const state = get();
+      const next = cloneDoc(state.doc);
+      const layer = createRasterLayer(name.trim() || 'Sprite généré');
+      padLayerFrames(layer, next.frames.length);
+      const target = createPixelBuffer(next.width, next.height);
+      blitBuffer(
+        buffer,
+        target,
+        Math.floor((next.width - buffer.width) / 2),
+        Math.floor((next.height - buffer.height) / 2),
+      );
+      const frameIndex = clamp(state.currentFrame, 0, next.frames.length - 1);
+      layer.frames[frameIndex] = target;
+      next.layers.push(layer);
+      commitStructural('Ajouter un sprite', next, { activeLayerId: layer.id });
     },
   };
 });

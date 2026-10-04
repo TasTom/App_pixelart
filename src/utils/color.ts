@@ -77,3 +77,41 @@ export function normalizeHexInput(value: string): string | null {
 export function isTransparent(packed: number): boolean {
   return ((packed >>> 24) & 255) === 0;
 }
+
+/** Convertit HSL (h 0-360, s et l 0-1) en couleur empaquetée opaque. */
+export function hslToPacked(h: number, s: number, l: number, a = 255): number {
+  const hue = ((h % 360) + 360) % 360;
+  const sat = Math.max(0, Math.min(1, s));
+  const light = Math.max(0, Math.min(1, l));
+  const c = (1 - Math.abs(2 * light - 1)) * sat;
+  const x = c * (1 - Math.abs(((hue / 60) % 2) - 1));
+  const m = light - c / 2;
+  let r = 0;
+  let g = 0;
+  let b = 0;
+  if (hue < 60) {
+    r = c;
+    g = x;
+  } else if (hue < 120) {
+    r = x;
+    g = c;
+  } else if (hue < 180) {
+    g = c;
+    b = x;
+  } else if (hue < 240) {
+    g = x;
+    b = c;
+  } else if (hue < 300) {
+    r = x;
+    b = c;
+  } else {
+    r = c;
+    b = x;
+  }
+  return packColor(
+    Math.round((r + m) * 255),
+    Math.round((g + m) * 255),
+    Math.round((b + m) * 255),
+    a,
+  );
+}

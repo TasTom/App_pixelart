@@ -1,9 +1,9 @@
 # PixelForge — Éditeur pixel art, animations et tilemaps
 
 PixelForge est une application web pour créer du pixel art professionnel :
-dessin au pixel près, calques, animations image par image, tilemaps pour vos
-jeux vidéo, et exports vers tous les formats utiles (PNG, GIF, spritesheet,
-JSON Tiled).
+**génération de sprites et d'animations à partir de prompt**, dessin au pixel
+près, calques, animations image par image, tilemaps pour vos jeux vidéo, et
+exports vers tous les formats utiles (PNG, GIF, spritesheet, JSON Tiled).
 
 ![stack](https://img.shields.io/badge/React_19-TypeScript-Vite-7c6cf0)
 

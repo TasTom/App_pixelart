@@ -635,3 +635,134 @@ button {
 ::-webkit-scrollbar-thumb:hover {
   background: #4a4a58;
 }
+/* ---------- Onglets de la barre latérale ---------- */
+.sidebar-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 8px 8px 0;
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  background: var(--panel);
+}
+
+.sidebar-tabs button {
+  flex: 1;
+  border-radius: 8px 8px 0 0;
+  border-bottom: none;
+  padding: 8px 6px;
+  color: var(--text-dim);
+}
+
+.sidebar-tabs button.active {
+  background: var(--panel-2);
+  color: var(--text);
+  border-color: var(--border);
+  border-bottom: 1px solid var(--panel-2);
+  margin-bottom: -1px;
+}
+
+/* ---------- Génération de sprites ---------- */
+.gen-panel {
+  gap: 12px;
+}
+
+.gen-prompt {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.gen-prompt textarea {
+  font: inherit;
+  color: var(--text);
+  background: #14141b;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  resize: vertical;
+  min-height: 62px;
+  user-select: text;
+}
+
+.gen-prompt textarea:focus {
+  outline: 1px solid var(--accent);
+}
+
+.gen-run {
+  width: 100%;
+  padding: 9px 10px;
+  font-weight: 600;
+}
+
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.chip {
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  color: var(--text-dim);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.field.grow {
+  flex: 1;
+}
+
+.gen-error {
+  background: rgba(227, 83, 106, 0.16);
+  border: 1px solid rgba(227, 83, 106, 0.5);
+  color: #ffb3c0;
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 12px;
+  user-select: text;
+}
+.result-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+  gap: 8px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.result-card {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  align-items: center;
+}
+
+.result-canvas {
+  width: 92px;
+  height: 92px;
+  border-radius: 6px;
+  image-rendering: pixelated;
+  border: 1px solid var(--border);
+}
+
+.result-meta {
+  display: flex;
+  gap: 4px;
+}
+
+.result-actions {
+  display: flex;
+  gap: 4px;
+  width: 100%;
+}
+
+.result-actions button {
+  flex: 1;
+}

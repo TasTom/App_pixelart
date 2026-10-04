@@ -1,11 +1,9 @@
 import { useEffect } from 'react';
 import { CanvasStage } from './components/CanvasStage';
-import { ColorPanel } from './components/ColorPanel';
-import { LayersPanel } from './components/LayersPanel';
 import { NewDocDialog } from './components/NewDocDialog';
+import { Sidebar } from './components/Sidebar';
 import { StatusBar } from './components/StatusBar';
 import { TimelinePanel } from './components/TimelinePanel';
-import { TilesetPanel } from './components/TilesetPanel';
 import { ToolBar } from './components/ToolBar';
 import { TopBar } from './components/TopBar';
 import { exportProject, parseProject, serializeProject } from './export/exporters';
@@ -154,11 +152,7 @@ export default function App() {
           <CanvasStage />
           <TimelinePanel />
         </div>
-        <aside className="sidebar">
-          <ColorPanel />
-          <LayersPanel />
-          <TilesetPanel />
-        </aside>
+        <Sidebar />
       </div>
       <StatusBar />
       <NewDocDialog />
