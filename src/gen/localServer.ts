@@ -5,6 +5,7 @@
  */
 import type { RawImage } from './pixelate';
 import { base64ImageToBlob, blobToRawImage } from './ai';
+import { withTriggerWords } from './loras';
 
 export type LocalEngineKind = 'a1111' | 'comfyui';
 
@@ -24,6 +25,11 @@ export interface LocalServerConfig {
   /** A1111 : LoRA pixel art appliqué via le prompt (<lora:nom:poids>). */
   lora: string;
   loraWeight: number;
+  /**
+   * Mots-déclencheurs de la LoRA, ajoutés automatiquement en tête de prompt
+   * (ex. « pixel art, PixArFK » pour PixelArtRedmond).
+   */
+  triggerWords: string;
 }
 
 export interface LocalGenParams {
@@ -88,6 +94,7 @@ export function defaultServerConfig(engine: LocalEngineKind = 'a1111'): LocalSer
     negativePrompt: DEFAULT_NEGATIVE_PROMPT,
     lora: '',
     loraWeight: 0.8,
+    triggerWords: '',
   };
 }
 
@@ -131,8 +138,9 @@ export function buildA1111Payload(
   cfg: LocalServerConfig,
   params: LocalGenParams,
 ): A1111Payload {
+  const prompt = withTriggerWords(params.prompt, cfg.triggerWords);
   return {
-    prompt: (params.prompt + loraToken(cfg.lora, cfg.loraWeight)).trim(),
+    prompt: (prompt + loraToken(cfg.lora, cfg.loraWeight)).trim(),
     negative_prompt: cfg.negativePrompt,
     steps: Math.max(1, Math.round(cfg.steps)),
     cfg_scale: cfg.cfgScale,
@@ -172,6 +180,7 @@ export function buildComfyWorkflow(
   const useLora = loraName.length > 0;
   const modelSource: [string, number] = useLora ? ['0', 0] : ['1', 0];
   const clipSource: [string, number] = useLora ? ['0', 1] : ['1', 1];
+  const prompt = withTriggerWords(params.prompt, cfg.triggerWords);
 
   const workflow: ComfyWorkflow = {
     '1': {
@@ -188,7 +197,7 @@ export function buildComfyWorkflow(
     },
     '3': {
       class_type: 'CLIPTextEncode',
-      inputs: { text: params.prompt, clip: clipSource },
+      inputs: { text: prompt, clip: clipSource },
     },
     '4': {
       class_type: 'CLIPTextEncode',

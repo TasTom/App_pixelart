@@ -16,6 +16,7 @@ import {
   type LocalServerConfig,
   type ServerStatus,
 } from '../gen/localServer';
+import { describeLoraTrigger, findLoraTrigger } from '../gen/loras';
 import {
   cancelAllGenerations,
   cancelGeneration,
@@ -139,7 +140,16 @@ function loadServerConfig(): LocalServerConfig {
     const saved = window.localStorage.getItem(SERVER_STORAGE);
     if (saved) {
       const parsed = JSON.parse(saved) as Partial<LocalServerConfig>;
-      return { ...defaultServerConfig(parsed.engine ?? 'a1111'), ...parsed };
+      const merged = {
+        ...defaultServerConfig(parsed.engine ?? 'a1111'),
+        ...parsed,
+      };
+      // Complète les mots-déclencheurs des configurations enregistrées
+      // avant l'arrivée de cette fonctionnalité.
+      if (merged.lora.trim() && !merged.triggerWords.trim()) {
+        merged.triggerWords = findLoraTrigger(merged.lora) ?? '';
+      }
+      return merged;
     }
   } catch {
     // configuration illisible : valeurs par défaut
@@ -235,6 +245,23 @@ export function GenPanel() {
 
   const patchServer = (patch: Partial<LocalServerConfig>): void => {
     setServer((prev) => ({ ...prev, ...patch }));
+  };
+
+  /**
+   * Change la LoRA et met à jour les mots-déclencheurs : détectés
+   * automatiquement, sauf si l'utilisateur les a saisis à la main.
+   */
+  const applyLora = (lora: string): void => {
+    setServer((prev) => {
+      const detected = findLoraTrigger(lora) ?? '';
+      const previousAuto = findLoraTrigger(prev.lora) ?? '';
+      const custom = prev.triggerWords !== '' && prev.triggerWords !== previousAuto;
+      return {
+        ...prev,
+        lora,
+        triggerWords: custom ? prev.triggerWords : detected,
+      };
+    });
   };
 
   const testConnection = async (): Promise<void> => {
@@ -558,7 +585,7 @@ export function GenPanel() {
                   <span>LoRA pixel art</span>
                   <select
                     value={server.lora}
-                    onChange={(e) => patchServer({ lora: e.target.value })}
+                    onChange={(e) => applyLora(e.target.value)}
                   >
                     <option value="">— aucune —</option>
                     {(serverStatus?.loras ?? []).map((lora) => (
@@ -611,9 +638,31 @@ export function GenPanel() {
                   spellCheck={false}
                   placeholder="pixel-art-xl"
                   value={server.lora}
-                  onChange={(e) => patchServer({ lora: e.target.value })}
+                  onChange={(e) => applyLora(e.target.value)}
                 />
               </label>
+            </div>
+          )}
+
+          <label className="field">
+            <span>Mots-déclencheurs (ajoutés en tête de prompt)</span>
+            <input
+              type="text"
+              spellCheck={false}
+              placeholder="pixel art, PixArFK"
+              value={server.triggerWords}
+              onChange={(e) => patchServer({ triggerWords: e.target.value })}
+            />
+          </label>
+          {server.lora.trim().length > 0 && (
+            <div className="hint">
+              {findLoraTrigger(server.lora)
+                ? `Déclencheur détecté automatiquement${
+                    describeLoraTrigger(server.lora)
+                      ? ` (${describeLoraTrigger(server.lora)})`
+                      : ''
+                  }. Il n’est ajouté qu’une fois, même si vous l’écrivez déjà dans le prompt.`
+                : 'Aucun mot-déclencheur connu pour cette LoRA — laissez vide si elle n’en nécessite pas.'}
             </div>
           )}
 
