@@ -110,6 +110,31 @@ describe('buildComfyWorkflow', () => {
     expect(wf['6'].inputs.samples).toEqual(['5', 0]);
     expect(wf['7'].inputs.images).toEqual(['6', 0]);
   });
+
+  it('insère un nœud LoraLoader quand une LoRA est choisie', () => {
+    const wf = buildComfyWorkflow(
+      { ...cfgComfy, lora: 'pixel-art-xl.safetensors', loraWeight: 0.75 },
+      { prompt: 'chevalier', seed: 3 },
+    );
+    const lora = wf['0'];
+    expect(lora.class_type).toBe('LoraLoader');
+    expect(lora.inputs.lora_name).toBe('pixel-art-xl.safetensors');
+    expect(lora.inputs.strength_model).toBe(0.75);
+    expect(lora.inputs.strength_clip).toBe(0.75);
+    expect(lora.inputs.model).toEqual(['1', 0]);
+    expect(lora.inputs.clip).toEqual(['1', 1]);
+    // Le sampler et les textes passent par la LoRA.
+    expect(wf['5'].inputs.model).toEqual(['0', 0]);
+    expect(wf['3'].inputs.clip).toEqual(['0', 1]);
+    expect(wf['4'].inputs.clip).toEqual(['0', 1]);
+  });
+
+  it('n’ajoute aucun nœud LoRA sans sélection', () => {
+    const wf = buildComfyWorkflow({ ...cfgComfy, lora: '  ' }, { prompt: 'x', seed: 0 });
+    expect(wf['0']).toBeUndefined();
+    expect(wf['5'].inputs.model).toEqual(['1', 0]);
+    expect(wf['3'].inputs.clip).toEqual(['1', 1]);
+  });
 });
 
 describe('parseComfyImages', () => {

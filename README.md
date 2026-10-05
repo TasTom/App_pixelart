@@ -40,6 +40,11 @@ npm run mock:sd    # serveur de test A1111 + ComfyUI (validation sans GPU)
 - **Styles** : RPG 16-bit, Game Boy (4 couleurs), NES 8-bit, Arcade néon,
   Cartoon — ou « Auto » selon le prompt.
 - **Variantes** : jusqu'à 4 résultats par génération. Tailles 16×16 à 64×64.
+- **File d'attente** : les demandes s'enchaînent (un serveur local génère une
+  image à la fois) avec **barre de progression** — y compris l'avancement
+  réel du serveur (Automatic1111) — annulation d'une demande ou de toutes,
+  et nettoyage des demandes terminées. Vous pouvez continuer à dessiner
+  pendant la génération.
 - **Trois moteurs** :
   - *Générateur local* : hors-ligne, gratuit, instantané et reproductible
     (même prompt + graine ⇒ même sprite) ;
@@ -68,8 +73,15 @@ npm run mock:sd    # serveur de test A1111 + ComfyUI (validation sans GPU)
    disponibles sont récupérés automatiquement.
 3. Réglez les paramètres (étapes, CFG, sampler, résolution, prompt négatif)
    et générez. Pour un rendu pixel art net, chargez un modèle spécialisé
-   (ex. *PixelArt-Diffusion*, ou SDXL + LoRA *pixel-art-xl*) — pour A1111,
-   le champ **LoRA** ajoute automatiquement `<lora:nom:poids>` au prompt.
+   (ex. *PixelArt-Diffusion*, ou SDXL + LoRA *pixel-art-xl*) :
+   - **ComfyUI** : les LoRA du dossier `models/loras` sont détectées et
+     appliquées via un nœud `LoraLoader` (sélecteur + poids) ;
+   - **Automatic1111 / Forge** : le champ **LoRA** ajoute automatiquement
+     `<lora:nom:poids>` au prompt.
+
+Pendant la génération, la **barre de progression** affiche l'avancement
+réel du serveur (via `/sdapi/v1/progress` sur A1111, temps écoulé sur
+ComfyUI) ; chaque demande peut être annulée individuellement.
 
 Seul le prompt enrichi part vers le serveur ; les images reviennent en local
 et sont pixelisées par l'application (fond transparent, palette réduite).
@@ -150,6 +162,8 @@ src/
 │   ├── prompt.ts         # Analyse du prompt (type, couleurs, style)
 │   ├── procedural.ts     # Génération locale de sprites et animations
 │   ├── pixelate.ts       # Image → pixel art (taille, fond, palette)
+│   ├── runner.ts         # Exécution d'une génération (progression, annulation)
+│   ├── queue.ts          # File d'attente (une génération à la fois)
 │   ├── localServer.ts    # Serveur IA local (ComfyUI / Automatic1111)
 │   └── ai.ts             # IA en ligne (API compatible OpenAI)
 ├── core/
@@ -168,15 +182,16 @@ scripts/
 ```
 
 Les opérations de dessin **et de génération** sont testées par Vitest
-(70 tests) : remplissage, formes, composition, historique,
+(83 tests) : remplissage, formes, composition, historique,
 sauvegarde/restauration du projet, analyse de prompt, sprites
 déterministes, animations, conversion image → pixel art, payloads et
-workflows des serveurs IA locaux.
+workflows des serveurs IA locaux (dont le nœud LoRA), file d'attente
+(ordre, progression, annulation, erreurs).
 
 ## Pistes d'amélioration
 
-- Connexion LoRA native pour ComfyUI (nœud `LoraLoader`).
-- File d'attente et progression de la génération sur serveur local.
+- File d'attente : réordonnancement par glisser-déposer.
+- Connexion WebSocket à ComfyUI pour un pourcentage de progression exact.
 - Outil sélection : déplacer/copier-coller la zone sélectionnée.
 - Transformation : retournement, rotation, décalage de calque.
 - Mode symétrie (miroir horizontal/vertical).

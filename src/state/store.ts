@@ -49,12 +49,39 @@ export interface EditorUi {
   newDialogOpen: boolean;
 }
 
+export interface GenJob {
+  id: string;
+  prompt: string;
+  engine: 'local' | 'server' | 'ai';
+  status: 'queued' | 'running' | 'done' | 'error' | 'cancelled';
+  /** Avancement 0-1. */
+  progress: number;
+  detail: string;
+  error?: string;
+}
+
+export interface GeneratedSprite {
+  id: string;
+  prompt: string;
+  frames: PixelBuffer[];
+  engine: 'local' | 'server' | 'ai';
+}
+
 export interface EditorState extends EditorUi {
   doc: Doc;
   /** Incrémenté à chaque modification du document (rafraîchit les miniatures). */
   docRev: number;
   undoStack: HistoryEntry[];
   redoStack: HistoryEntry[];
+  /** File de génération de sprites (persiste entre les onglets). */
+  genJobs: GenJob[];
+  genResults: GeneratedSprite[];
+
+  addGenJob: (job: GenJob) => void;
+  updateGenJob: (id: string, patch: Partial<GenJob>) => void;
+  removeGenJob: (id: string) => void;
+  clearFinishedGenJobs: () => void;
+  addGenResults: (results: GeneratedSprite[]) => void;
 
   setUi: (patch: Partial<EditorUi>) => void;
   newDoc: (name: string, width: number, height: number, tileSize?: number) => void;
@@ -170,7 +197,39 @@ export const useEditorStore = create<EditorState>()((set, get) => {
     docRev: 0,
     undoStack: [],
     redoStack: [],
+    genJobs: [],
+    genResults: [],
     ...initialUi(initialDoc),
+
+    addGenJob: (job) => {
+      set((state) => ({ genJobs: [...state.genJobs, job] }));
+    },
+
+    updateGenJob: (id, patch) => {
+      set((state) => ({
+        genJobs: state.genJobs.map((job) =>
+          job.id === id ? { ...job, ...patch } : job,
+        ),
+      }));
+    },
+
+    removeGenJob: (id) => {
+      set((state) => ({ genJobs: state.genJobs.filter((job) => job.id !== id) }));
+    },
+
+    clearFinishedGenJobs: () => {
+      set((state) => ({
+        genJobs: state.genJobs.filter(
+          (job) => job.status === 'queued' || job.status === 'running',
+        ),
+      }));
+    },
+
+    addGenResults: (results) => {
+      set((state) => ({
+        genResults: [...results, ...state.genResults].slice(0, 12),
+      }));
+    },
 
     setUi: (patch) => set(patch),
 

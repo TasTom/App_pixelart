@@ -171,6 +171,11 @@ function readBody(req) {
 /** prompt_id → image simulée (ComfyUI). */
 const comfyJobs = new Map();
 
+/** Tâche A1111 en cours (pour /sdapi/v1/progress). */
+let a1111Job = null;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const path = url.pathname;
@@ -195,15 +200,28 @@ const server = http.createServer(async (req, res) => {
   if (path === '/sdapi/v1/samplers') {
     return sendJson(res, 200, [{ name: 'Euler a' }, { name: 'DPM++ 2M' }]);
   }
+  if (path === '/sdapi/v1/progress') {
+    const progress = a1111Job
+      ? Math.min(1, (Date.now() - a1111Job.startedAt) / a1111Job.duration)
+      : 0;
+    return sendJson(res, 200, {
+      progress,
+      state: { job_count: a1111Job ? 1 : 0, sampling_step: 0, sampling_steps: 24 },
+    });
+  }
   if (path === '/sdapi/v1/txt2img' && req.method === 'POST') {
     const body = await readBody(req);
     const prompt = String(body.prompt ?? '');
     const size = Math.min(1024, Math.max(64, Number(body.width) || 512));
-    const png = renderSprite(size, hashString(prompt));
     console.log(
       `[mock:a1111] txt2img « ${prompt.slice(0, 48)} » ${size}x${size} ` +
         `steps=${body.steps} cfg=${body.cfg_scale} seed=${body.seed}`,
     );
+    // Simule un temps de calcul pour que la barre de progression soit visible.
+    a1111Job = { startedAt: Date.now(), duration: 3000 };
+    await sleep(3000);
+    a1111Job = null;
+    const png = renderSprite(size, hashString(prompt));
     return sendJson(res, 200, {
       images: [png.toString('base64')],
       parameters: body,
@@ -239,6 +257,19 @@ const server = http.createServer(async (req, res) => {
       },
     });
   }
+  if (path === '/object_info/LoraLoader') {
+    return sendJson(res, 200, {
+      LoraLoader: {
+        input: {
+          required: {
+            lora_name: [
+              ['pixel-art-xl.safetensors', 'pixel-art-redux.safetensors'],
+            ],
+          },
+        },
+      },
+    });
+  }
   if (path === '/prompt' && req.method === 'POST') {
     const body = await readBody(req);
     const workflow = body.prompt ?? {};
@@ -255,11 +286,17 @@ const server = http.createServer(async (req, res) => {
       png: renderSprite(size, hashString(String(positive?.inputs?.text ?? ''))),
       readyAt: Date.now() + 1200,
     });
+    const lora = nodes.find((n) => n?.class_type === 'LoraLoader');
     console.log(
       `[mock:comfyui] prompt ${promptId} ` +
         `« ${String(positive?.inputs?.text ?? '').slice(0, 40)} » ` +
         `steps=${sampler?.inputs?.steps} cfg=${sampler?.inputs?.cfg} ` +
-        `sampler=${sampler?.inputs?.sampler_name}`,
+        `sampler=${sampler?.inputs?.sampler_name} ` +
+        `lora=${
+          lora
+            ? `${lora.inputs.lora_name}@${lora.inputs.strength_model}`
+            : 'aucune'
+        }`,
     );
     return sendJson(res, 200, { prompt_id: promptId, number: 1 });
   }

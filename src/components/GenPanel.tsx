@@ -2,49 +2,80 @@ import { useEffect, useRef, useState } from 'react';
 import type { PixelBuffer } from '../types';
 import { drawCheckerboard } from '../canvas/compositor';
 import { useEditorStore } from '../state/store';
-import {
-  analyzePrompt,
-  buildAiPrompt,
-  type ArtStyle,
-  type Motion,
-} from '../gen/prompt';
-import {
-  generateAnimation,
-  generateSprite,
-  PROMPT_EXAMPLES,
-} from '../gen/procedural';
-import { generateWithAi, type AiModelId } from '../gen/ai';
+import { analyzePrompt, type ArtStyle, type Motion } from '../gen/prompt';
+import { PROMPT_EXAMPLES } from '../gen/procedural';
+import type { AiModelId } from '../gen/ai';
 import {
   defaultServerConfig,
   DEFAULT_NEGATIVE_PROMPT,
   DEFAULT_URLS,
   FALLBACK_SAMPLERS,
-  generateOnLocalServer,
   SCHEDULERS,
   testLocalServer,
   type LocalEngineKind,
   type LocalServerConfig,
   type ServerStatus,
 } from '../gen/localServer';
-import { imageToPixelBuffer } from '../gen/pixelate';
+import {
+  cancelAllGenerations,
+  cancelGeneration,
+  enqueueGeneration,
+} from '../gen/queue';
+import type { GenJob } from '../state/store';
 
 const AI_KEY_STORAGE = 'pixelforge.aikey';
 const SERVER_STORAGE = 'pixelforge.server';
+const GEN_FORM_STORAGE = 'pixelforge.genform';
 
 type EngineId = 'local' | 'server' | 'ai';
-type ResultEngine = 'local' | 'server' | 'ai';
 
-interface GenResult {
-  id: string;
+interface GenForm {
   prompt: string;
-  frames: PixelBuffer[];
-  engine: ResultEngine;
+  styleChoice: ArtStyle | 'auto';
+  size: number;
+  motion: Motion;
+  frameCount: number;
+  variations: number;
+  engine: EngineId;
+  aiModel: AiModelId;
+  useDocPalette: boolean;
 }
 
-const ENGINE_LABELS: Record<ResultEngine, string> = {
+function loadGenForm(): GenForm {
+  const defaults: GenForm = {
+    prompt: 'un petit dragon bleu avec des ailes',
+    styleChoice: 'auto',
+    size: 32,
+    motion: 'none',
+    frameCount: 4,
+    variations: 2,
+    engine: 'local',
+    aiModel: 'gpt-image-1',
+    useDocPalette: false,
+  };
+  try {
+    const saved = window.localStorage.getItem(GEN_FORM_STORAGE);
+    if (saved) {
+      return { ...defaults, ...(JSON.parse(saved) as Partial<GenForm>) };
+    }
+  } catch {
+    // valeurs par défaut
+  }
+  return defaults;
+}
+
+const ENGINE_LABELS: Record<EngineId, string> = {
   local: 'Local',
   server: 'Serveur local',
   ai: 'IA en ligne',
+};
+
+const JOB_STATUS_LABELS: Record<GenJob['status'], string> = {
+  queued: 'En attente',
+  running: 'En cours',
+  done: 'Terminé',
+  error: 'Échec',
+  cancelled: 'Annulé',
 };
 
 function ResultThumb({ frames }: { frames: PixelBuffer[] }) {
@@ -119,14 +150,21 @@ function loadServerConfig(): LocalServerConfig {
 export function GenPanel() {
   const newDocFromBuffers = useEditorStore((s) => s.newDocFromBuffers);
   const addLayerFromBuffer = useEditorStore((s) => s.addLayerFromBuffer);
+  const jobs = useEditorStore((s) => s.genJobs);
+  const results = useEditorStore((s) => s.genResults);
+  const clearFinishedGenJobs = useEditorStore((s) => s.clearFinishedGenJobs);
+  const removeGenJob = useEditorStore((s) => s.removeGenJob);
 
-  const [prompt, setPrompt] = useState('un petit dragon bleu avec des ailes');
-  const [styleChoice, setStyleChoice] = useState<ArtStyle | 'auto'>('auto');
-  const [size, setSize] = useState(32);
-  const [motion, setMotion] = useState<Motion>('none');
-  const [frameCount, setFrameCount] = useState(4);
-  const [variations, setVariations] = useState(2);
-  const [engine, setEngine] = useState<EngineId>('local');
+  const [initial] = useState(loadGenForm);
+  const [prompt, setPrompt] = useState(initial.prompt);
+  const [styleChoice, setStyleChoice] = useState<ArtStyle | 'auto'>(
+    initial.styleChoice,
+  );
+  const [size, setSize] = useState(initial.size);
+  const [motion, setMotion] = useState<Motion>(initial.motion);
+  const [frameCount, setFrameCount] = useState(initial.frameCount);
+  const [variations, setVariations] = useState(initial.variations);
+  const [engine, setEngine] = useState<EngineId>(initial.engine);
   const [apiKey, setApiKey] = useState(() => {
     try {
       return window.localStorage.getItem(AI_KEY_STORAGE) ?? '';
@@ -134,14 +172,17 @@ export function GenPanel() {
       return '';
     }
   });
-  const [aiModel, setAiModel] = useState<AiModelId>('gpt-image-1');
-  const [useDocPalette, setUseDocPalette] = useState(false);
+  const [aiModel, setAiModel] = useState<AiModelId>(initial.aiModel);
+  const [useDocPalette, setUseDocPalette] = useState(initial.useDocPalette);
   const [server, setServer] = useState<LocalServerConfig>(loadServerConfig);
   const [serverStatus, setServerStatus] = useState<ServerStatus | null>(null);
   const [testing, setTesting] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [results, setResults] = useState<GenResult[]>([]);
+  const [formError, setFormError] = useState<string | null>(null);
+
+  const activeCount = jobs.filter(
+    (job) => job.status === 'queued' || job.status === 'running',
+  ).length;
+  const finishedCount = jobs.length - activeCount;
 
   useEffect(() => {
     try {
@@ -150,6 +191,38 @@ export function GenPanel() {
       // quota ou localStorage indisponible
     }
   }, [server]);
+
+  // Les réglages du générateur survivent au changement d'onglet.
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        GEN_FORM_STORAGE,
+        JSON.stringify({
+          prompt,
+          styleChoice,
+          size,
+          motion,
+          frameCount,
+          variations,
+          engine,
+          aiModel,
+          useDocPalette,
+        }),
+      );
+    } catch {
+      // quota ou localStorage indisponible
+    }
+  }, [
+    prompt,
+    styleChoice,
+    size,
+    motion,
+    frameCount,
+    variations,
+    engine,
+    aiModel,
+    useDocPalette,
+  ]);
 
   const saveKey = (value: string): void => {
     setApiKey(value);
@@ -166,7 +239,7 @@ export function GenPanel() {
 
   const testConnection = async (): Promise<void> => {
     setTesting(true);
-    setError(null);
+    setFormError(null);
     const status = await testLocalServer(server);
     setServerStatus(status);
     setTesting(false);
@@ -179,89 +252,55 @@ export function GenPanel() {
       if (status.samplers.length > 0 && !status.samplers.includes(server.sampler)) {
         patch.sampler = status.samplers[0];
       }
+      if (server.lora.trim() && !status.loras.includes(server.lora.trim())) {
+        patch.lora = '';
+      }
     } else if (!FALLBACK_SAMPLERS.a1111.includes(server.sampler)) {
       patch.sampler = FALLBACK_SAMPLERS.a1111[0];
     }
     if (Object.keys(patch).length > 0) patchServer(patch);
   };
 
-  const generate = async (): Promise<void> => {
+  const generate = (): void => {
     const text = prompt.trim();
-    if (!text || busy) return;
-    setBusy(true);
-    setError(null);
-    try {
-      const style: ArtStyle =
-        styleChoice === 'auto' ? analyzePrompt(text).style : styleChoice;
-      const quantizePalette =
+    if (!text) return;
+    setFormError(null);
+
+    if (engine === 'ai' && !apiKey.trim()) {
+      setFormError('Renseignez votre clé API pour le moteur « IA en ligne ».');
+      return;
+    }
+    if (engine === 'server') {
+      if (!server.baseUrl.trim()) {
+        setFormError('Renseignez l’URL du serveur local.');
+        return;
+      }
+      if (server.engine === 'comfyui' && !server.checkpoint.trim()) {
+        setFormError(
+          'Choisissez un checkpoint ComfyUI (bouton « Tester la connexion »).',
+        );
+        return;
+      }
+    }
+
+    const style: ArtStyle =
+      styleChoice === 'auto' ? analyzePrompt(text).style : styleChoice;
+
+    enqueueGeneration({
+      prompt: text,
+      engine,
+      style,
+      size,
+      motion,
+      frameCount,
+      variations,
+      palette:
         engine !== 'local' && useDocPalette
           ? useEditorStore.getState().doc.palette
-          : undefined;
-      const maxColors = style === 'gameboy' ? 4 : style === 'nes' ? 16 : 24;
-      const created: GenResult[] = [];
-      const baseSeed = Math.floor(Math.random() * 1_000_000_000);
-
-      for (let v = 0; v < variations; v++) {
-        const seed = baseSeed + v * 7919;
-        if (engine === 'local') {
-          const frames =
-            motion === 'none'
-              ? [generateSprite({ prompt: text, seed, size, style })]
-              : generateAnimation({
-                  prompt: text,
-                  seed,
-                  size,
-                  style,
-                  motion,
-                  frameCount,
-                });
-          created.push({
-            id: `${seed}-${v}`,
-            prompt: text,
-            frames,
-            engine: 'local',
-          });
-          continue;
-        }
-
-        // Moteurs IA (serveur local ou API en ligne) : une image par frame.
-        const count = motion === 'none' ? 1 : Math.min(frameCount, 4);
-        const frames: PixelBuffer[] = [];
-        for (let f = 0; f < count; f++) {
-          const enriched = buildAiPrompt(text, style, motion, f, count);
-          const raw =
-            engine === 'server'
-              ? await generateOnLocalServer(server, {
-                  prompt: enriched,
-                  seed: seed + f,
-                })
-              : await generateWithAi({
-                  apiKey,
-                  model: aiModel,
-                  prompt: enriched,
-                });
-          frames.push(
-            imageToPixelBuffer(raw, {
-              size,
-              transparentBackground: true,
-              palette: quantizePalette,
-              maxColors,
-            }),
-          );
-        }
-        created.push({
-          id: `${engine}-${Date.now()}-${v}`,
-          prompt: text,
-          frames,
-          engine,
-        });
-      }
-      setResults((prev) => [...created, ...prev].slice(0, 12));
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'La génération a échoué.');
-    } finally {
-      setBusy(false);
-    }
+          : undefined,
+      server: engine === 'server' ? server : undefined,
+      ai: engine === 'ai' ? { apiKey, model: aiModel } : undefined,
+    });
   };
 
   return (
@@ -282,12 +321,18 @@ export function GenPanel() {
         <button
           type="button"
           className="primary gen-run"
-          disabled={busy || !prompt.trim()}
-          onClick={() => void generate()}
+          disabled={!prompt.trim()}
+          onClick={generate}
         >
-          {busy ? 'Génération…' : '✦ Générer'}
+          ✦ Générer
         </button>
       </div>
+      {activeCount > 0 && (
+        <div className="hint">
+          {activeCount} génération(s) en cours — vous pouvez continuer à
+          dessiner pendant ce temps.
+        </div>
+      )}
 
       <div className="chip-row">
         {PROMPT_EXAMPLES.map((example) => (
@@ -402,6 +447,7 @@ export function GenPanel() {
                   baseUrl: DEFAULT_URLS[kind],
                   sampler: FALLBACK_SAMPLERS[kind][0],
                   checkpoint: kind === 'comfyui' ? server.checkpoint : '',
+                  lora: '',
                 });
               }}
             >
@@ -506,6 +552,44 @@ export function GenPanel() {
                   </select>
                 </label>
               </div>
+
+              <div className="row gap">
+                <label className="field grow">
+                  <span>LoRA pixel art</span>
+                  <select
+                    value={server.lora}
+                    onChange={(e) => patchServer({ lora: e.target.value })}
+                  >
+                    <option value="">— aucune —</option>
+                    {(serverStatus?.loras ?? []).map((lora) => (
+                      <option key={lora} value={lora}>
+                        {lora}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="field grow">
+                  <span>Poids : {server.loraWeight.toFixed(2)}</span>
+                  <input
+                    className="slider"
+                    type="range"
+                    min={0}
+                    max={1.5}
+                    step={0.05}
+                    value={server.loraWeight}
+                    disabled={server.lora.trim().length === 0}
+                    onChange={(e) =>
+                      patchServer({ loraWeight: Number(e.target.value) })
+                    }
+                  />
+                </label>
+              </div>
+              {serverStatus?.ok && serverStatus.loras.length === 0 && (
+                <div className="hint">
+                  Aucune LoRA détectée par ComfyUI (placez-les dans{' '}
+                  <code>models/loras</code>).
+                </div>
+              )}
             </>
           )}
 
@@ -641,7 +725,82 @@ export function GenPanel() {
         </>
       )}
 
-      {error && <div className="gen-error">{error}</div>}
+      {formError && <div className="gen-error">{formError}</div>}
+
+      {jobs.length > 0 && (
+        <>
+          <div className="panel-title row-between">
+            <span>
+              File d’attente{jobs.length > 0 ? ` (${jobs.length})` : ''}
+            </span>
+            <span className="row gap">
+              {activeCount > 0 && (
+                <button
+                  type="button"
+                  className="small"
+                  onClick={() => cancelAllGenerations()}
+                >
+                  Tout annuler
+                </button>
+              )}
+              {finishedCount > 0 && (
+                <button
+                  type="button"
+                  className="small"
+                  onClick={() => clearFinishedGenJobs()}
+                >
+                  Vider
+                </button>
+              )}
+            </span>
+          </div>
+
+          <div className="job-list">
+            {jobs.map((job) => (
+              <div key={job.id} className={`job-row ${job.status}`}>
+                <div className="job-head">
+                  <span className={`badge ${job.status}`}>
+                    {JOB_STATUS_LABELS[job.status]}
+                  </span>
+                  <span className="job-prompt" title={job.prompt}>
+                    {job.prompt}
+                  </span>
+                  {job.status === 'queued' || job.status === 'running' ? (
+                    <button
+                      type="button"
+                      className="icon-btn"
+                      title="Annuler"
+                      onClick={() => cancelGeneration(job.id)}
+                    >
+                      ✕
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      className="icon-btn"
+                      title="Retirer"
+                      onClick={() => removeGenJob(job.id)}
+                    >
+                      ✕
+                    </button>
+                  )}
+                </div>
+                <div className={`job-detail ${job.error ? 'ko' : ''}`}>
+                  {job.error ?? job.detail}
+                </div>
+                {(job.status === 'running' || job.status === 'queued') && (
+                  <div className="progress">
+                    <div
+                      className="progress-fill"
+                      style={{ width: `${Math.round(job.progress * 100)}%` }}
+                    />
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </>
+      )}
 
       <div className="panel-title">
         Résultats {results.length > 0 && `(${results.length})`}

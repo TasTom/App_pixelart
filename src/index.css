@@ -820,3 +820,97 @@ button {
   color: #9fd6ff;
   user-select: text;
 }
+
+/* ---------- File d'attente de génération ---------- */
+.panel-title.row-between {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.job-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.job-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 6px 8px;
+}
+
+.job-row.running {
+  border-color: rgba(80, 170, 255, 0.5);
+}
+
+.job-row.done {
+  border-color: rgba(126, 224, 138, 0.35);
+}
+
+.job-row.error {
+  border-color: rgba(227, 83, 106, 0.5);
+}
+
+.job-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.job-prompt {
+  flex: 1;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.job-detail {
+  font-size: 11px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.job-detail.ko {
+  color: #ffb3c0;
+  white-space: normal;
+  word-break: break-word;
+}
+
+.progress {
+  height: 5px;
+  border-radius: 999px;
+  background: #14141b;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent), #41a6f6);
+  transition: width 0.25s ease;
+}
+
+.badge.running {
+  background: rgba(80, 170, 255, 0.25);
+  color: #9fd6ff;
+}
+
+.badge.done {
+  background: rgba(126, 224, 138, 0.2);
+  color: #a9ecb2;
+}
+
+.badge.error {
+  background: rgba(227, 83, 106, 0.22);
+  color: #ffb3c0;
+}

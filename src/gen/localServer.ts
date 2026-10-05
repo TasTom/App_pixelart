@@ -30,6 +30,11 @@ export interface LocalGenParams {
   prompt: string;
   seed: number;
   signal?: AbortSignal;
+  /**
+   * Reçoit des messages d'état (envoi, progression, récupération).
+   * `fraction` (0-1) permet de faire avancer la barre de progression.
+   */
+  onStatus?: (text: string, fraction?: number) => void;
 }
 
 export interface ServerStatus {
@@ -39,6 +44,8 @@ export interface ServerStatus {
   activeModel?: string;
   samplers: string[];
   schedulers: string[];
+  /** ComfyUI : LoRA installées, applicables via un nœud LoraLoader. */
+  loras: string[];
 }
 
 export interface ComfyImageRef {
@@ -161,7 +168,12 @@ export function buildComfyWorkflow(
   cfg: LocalServerConfig,
   params: LocalGenParams,
 ): ComfyWorkflow {
-  return {
+  const loraName = cfg.lora.trim();
+  const useLora = loraName.length > 0;
+  const modelSource: [string, number] = useLora ? ['0', 0] : ['1', 0];
+  const clipSource: [string, number] = useLora ? ['0', 1] : ['1', 1];
+
+  const workflow: ComfyWorkflow = {
     '1': {
       class_type: 'CheckpointLoaderSimple',
       inputs: { ckpt_name: cfg.checkpoint },
@@ -176,11 +188,11 @@ export function buildComfyWorkflow(
     },
     '3': {
       class_type: 'CLIPTextEncode',
-      inputs: { text: params.prompt, clip: ['1', 1] },
+      inputs: { text: params.prompt, clip: clipSource },
     },
     '4': {
       class_type: 'CLIPTextEncode',
-      inputs: { text: cfg.negativePrompt, clip: ['1', 1] },
+      inputs: { text: cfg.negativePrompt, clip: clipSource },
     },
     '5': {
       class_type: 'KSampler',
@@ -191,7 +203,7 @@ export function buildComfyWorkflow(
         sampler_name: cfg.sampler,
         scheduler: cfg.scheduler,
         denoise: 1,
-        model: ['1', 0],
+        model: modelSource,
         positive: ['3', 0],
         negative: ['4', 0],
         latent_image: ['2', 0],
@@ -206,6 +218,20 @@ export function buildComfyWorkflow(
       inputs: { filename_prefix: 'pixelforge', images: ['6', 0] },
     },
   };
+
+  if (useLora) {
+    workflow['0'] = {
+      class_type: 'LoraLoader',
+      inputs: {
+        lora_name: loraName,
+        strength_model: cfg.loraWeight,
+        strength_clip: cfg.loraWeight,
+        model: ['1', 0],
+        clip: ['1', 1],
+      },
+    };
+  }
+  return workflow;
 }
 
 /** Extrait les références d'images d'une réponse /history/{id}. */
@@ -274,6 +300,7 @@ export async function testLocalServer(
     models: [],
     samplers: [],
     schedulers: SCHEDULERS,
+    loras: [],
   };
   try {
     if (cfg.engine === 'a1111') {
@@ -312,6 +339,7 @@ export async function testLocalServer(
         activeModel,
         samplers: FALLBACK_SAMPLERS.a1111,
         schedulers: SCHEDULERS,
+        loras: [],
       };
     }
 
@@ -365,12 +393,28 @@ export async function testLocalServer(
       // samplers par défaut si /object_info indisponible
     }
 
+    let loras: string[] = [];
+    try {
+      const loraInfo = (await jsonOrThrow(
+        await fetch(`${url}/object_info/LoraLoader`),
+        'LoRA',
+      )) as { LoraLoader?: { input?: { required?: Record<string, unknown> } } };
+      const entry = loraInfo?.LoraLoader?.input?.required?.lora_name;
+      const list = Array.isArray(entry) ? entry[0] : undefined;
+      if (Array.isArray(list)) {
+        loras = list.filter((l): l is string => typeof l === 'string');
+      }
+    } catch {
+      // aucune LoRA installée ou nœud indisponible
+    }
+
     return {
       ok: true,
-      message: `Connecté à ComfyUI (${models.length} checkpoint(s) trouvé(s)).`,
+      message: `Connecté à ComfyUI (${models.length} checkpoint(s), ${loras.length} LoRA).`,
       models,
       samplers,
       schedulers,
+      loras,
     };
   } catch (err) {
     const message =
@@ -402,23 +446,52 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
+/** Avancement renvoyé par Automatic1111 (0-1), ou null si indisponible. */
+export async function fetchA1111Progress(url: string): Promise<number | null> {
+  try {
+    const res = await fetch(`${base(url)}/sdapi/v1/progress?skip_current_image=true`);
+    if (!res.ok) return null;
+    const json = (await res.json()) as { progress?: unknown };
+    const value = json.progress;
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+      return null;
+    }
+    return Math.min(1, value);
+  } catch {
+    return null;
+  }
+}
+
 async function runA1111(
   cfg: LocalServerConfig,
   params: LocalGenParams,
 ): Promise<Blob> {
   const url = base(cfg.baseUrl);
-  const res = await fetch(`${url}/sdapi/v1/txt2img`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(buildA1111Payload(cfg, params)),
-    signal: params.signal,
-  });
-  const json = await jsonOrThrow(res, 'Génération');
-  const images = parseA1111Images(json);
-  if (images.length === 0) {
-    throw new Error('Le serveur n’a renvoyé aucune image.');
+  params.onStatus?.('Envoi au serveur…');
+  const pollTimer = window.setInterval(() => {
+    void fetchA1111Progress(url).then((value) => {
+      if (value !== null) {
+        params.onStatus?.(`Génération ${Math.round(value * 100)} %`, value);
+      }
+    });
+  }, 900);
+  try {
+    const res = await fetch(`${url}/sdapi/v1/txt2img`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(buildA1111Payload(cfg, params)),
+      signal: params.signal,
+    });
+    const json = await jsonOrThrow(res, 'Génération');
+    const images = parseA1111Images(json);
+    if (images.length === 0) {
+      throw new Error('Le serveur n’a renvoyé aucune image.');
+    }
+    params.onStatus?.('Récupération de l’image…');
+    return base64ImageToBlob(images[0]);
+  } finally {
+    window.clearInterval(pollTimer);
   }
-  return base64ImageToBlob(images[0]);
 }
 
 async function runComfyUi(
@@ -437,6 +510,7 @@ async function runComfyUi(
       ? crypto.randomUUID()
       : Math.random().toString(36).slice(2);
 
+  params.onStatus?.('Envoi du workflow…');
   const submit = await fetch(`${url}/prompt`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -450,8 +524,11 @@ async function runComfyUi(
     typeof submitted.prompt_id === 'string' ? submitted.prompt_id : '';
   if (!promptId) throw new Error('ComfyUI n’a pas renvoyé d’identifiant de tâche.');
 
-  const deadline = Date.now() + 300_000;
+  const started = Date.now();
+  const deadline = started + 300_000;
   while (Date.now() < deadline) {
+    const elapsed = Math.round((Date.now() - started) / 1000);
+    params.onStatus?.(`Serveur en cours (${elapsed} s)…`);
     await sleep(900, params.signal);
     const res = await fetch(`${url}/history/${promptId}`, {
       signal: params.signal,
@@ -461,6 +538,7 @@ async function runComfyUi(
     const refs = parseComfyImages(history, promptId);
     const ref = refs[0];
     if (ref) {
+      params.onStatus?.('Récupération de l’image…');
       const query = new URLSearchParams({
         filename: ref.filename,
         subfolder: ref.subfolder,
