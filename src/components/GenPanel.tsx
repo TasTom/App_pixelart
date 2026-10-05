@@ -14,18 +14,38 @@ import {
   PROMPT_EXAMPLES,
 } from '../gen/procedural';
 import { generateWithAi, type AiModelId } from '../gen/ai';
+import {
+  defaultServerConfig,
+  DEFAULT_NEGATIVE_PROMPT,
+  DEFAULT_URLS,
+  FALLBACK_SAMPLERS,
+  generateOnLocalServer,
+  SCHEDULERS,
+  testLocalServer,
+  type LocalEngineKind,
+  type LocalServerConfig,
+  type ServerStatus,
+} from '../gen/localServer';
 import { imageToPixelBuffer } from '../gen/pixelate';
 
 const AI_KEY_STORAGE = 'pixelforge.aikey';
+const SERVER_STORAGE = 'pixelforge.server';
 
-type EngineId = 'local' | 'ai';
+type EngineId = 'local' | 'server' | 'ai';
+type ResultEngine = 'local' | 'server' | 'ai';
 
 interface GenResult {
   id: string;
   prompt: string;
   frames: PixelBuffer[];
-  engine: EngineId;
+  engine: ResultEngine;
 }
+
+const ENGINE_LABELS: Record<ResultEngine, string> = {
+  local: 'Local',
+  server: 'Serveur local',
+  ai: 'IA en ligne',
+};
 
 function ResultThumb({ frames }: { frames: PixelBuffer[] }) {
   const ref = useRef<HTMLCanvasElement>(null);
@@ -83,6 +103,19 @@ const STYLES: { id: ArtStyle | 'auto'; label: string }[] = [
   { id: 'cartoon', label: 'Cartoon mignon' },
 ];
 
+function loadServerConfig(): LocalServerConfig {
+  try {
+    const saved = window.localStorage.getItem(SERVER_STORAGE);
+    if (saved) {
+      const parsed = JSON.parse(saved) as Partial<LocalServerConfig>;
+      return { ...defaultServerConfig(parsed.engine ?? 'a1111'), ...parsed };
+    }
+  } catch {
+    // configuration illisible : valeurs par défaut
+  }
+  return defaultServerConfig('a1111');
+}
+
 export function GenPanel() {
   const newDocFromBuffers = useEditorStore((s) => s.newDocFromBuffers);
   const addLayerFromBuffer = useEditorStore((s) => s.addLayerFromBuffer);
@@ -103,9 +136,20 @@ export function GenPanel() {
   });
   const [aiModel, setAiModel] = useState<AiModelId>('gpt-image-1');
   const [useDocPalette, setUseDocPalette] = useState(false);
+  const [server, setServer] = useState<LocalServerConfig>(loadServerConfig);
+  const [serverStatus, setServerStatus] = useState<ServerStatus | null>(null);
+  const [testing, setTesting] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [results, setResults] = useState<GenResult[]>([]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(SERVER_STORAGE, JSON.stringify(server));
+    } catch {
+      // quota ou localStorage indisponible
+    }
+  }, [server]);
 
   const saveKey = (value: string): void => {
     setApiKey(value);
@@ -116,6 +160,31 @@ export function GenPanel() {
     }
   };
 
+  const patchServer = (patch: Partial<LocalServerConfig>): void => {
+    setServer((prev) => ({ ...prev, ...patch }));
+  };
+
+  const testConnection = async (): Promise<void> => {
+    setTesting(true);
+    setError(null);
+    const status = await testLocalServer(server);
+    setServerStatus(status);
+    setTesting(false);
+    if (!status.ok) return;
+    const patch: Partial<LocalServerConfig> = {};
+    if (server.engine === 'comfyui') {
+      if (status.models.length > 0 && !status.models.includes(server.checkpoint)) {
+        patch.checkpoint = status.models[0];
+      }
+      if (status.samplers.length > 0 && !status.samplers.includes(server.sampler)) {
+        patch.sampler = status.samplers[0];
+      }
+    } else if (!FALLBACK_SAMPLERS.a1111.includes(server.sampler)) {
+      patch.sampler = FALLBACK_SAMPLERS.a1111[0];
+    }
+    if (Object.keys(patch).length > 0) patchServer(patch);
+  };
+
   const generate = async (): Promise<void> => {
     const text = prompt.trim();
     if (!text || busy) return;
@@ -124,10 +193,11 @@ export function GenPanel() {
     try {
       const style: ArtStyle =
         styleChoice === 'auto' ? analyzePrompt(text).style : styleChoice;
-      const palette =
-        useDocPalette && engine === 'ai'
+      const quantizePalette =
+        engine !== 'local' && useDocPalette
           ? useEditorStore.getState().doc.palette
           : undefined;
+      const maxColors = style === 'gameboy' ? 4 : style === 'nes' ? 16 : 24;
       const created: GenResult[] = [];
       const baseSeed = Math.floor(Math.random() * 1_000_000_000);
 
@@ -151,32 +221,40 @@ export function GenPanel() {
             frames,
             engine: 'local',
           });
-        } else {
-          // Moteur IA : une image générée par frame (cadencée pour limiter les appels).
-          const count = motion === 'none' ? 1 : Math.min(frameCount, 4);
-          const frames: PixelBuffer[] = [];
-          for (let f = 0; f < count; f++) {
-            const raw = await generateWithAi({
-              apiKey,
-              model: aiModel,
-              prompt: buildAiPrompt(text, style, motion, f, count),
-            });
-            frames.push(
-              imageToPixelBuffer(raw, {
-                size,
-                transparentBackground: true,
-                palette,
-                maxColors: style === 'gameboy' ? 4 : style === 'nes' ? 16 : 24,
-              }),
-            );
-          }
-          created.push({
-            id: `ai-${Date.now()}-${v}`,
-            prompt: text,
-            frames,
-            engine: 'ai',
-          });
+          continue;
         }
+
+        // Moteurs IA (serveur local ou API en ligne) : une image par frame.
+        const count = motion === 'none' ? 1 : Math.min(frameCount, 4);
+        const frames: PixelBuffer[] = [];
+        for (let f = 0; f < count; f++) {
+          const enriched = buildAiPrompt(text, style, motion, f, count);
+          const raw =
+            engine === 'server'
+              ? await generateOnLocalServer(server, {
+                  prompt: enriched,
+                  seed: seed + f,
+                })
+              : await generateWithAi({
+                  apiKey,
+                  model: aiModel,
+                  prompt: enriched,
+                });
+          frames.push(
+            imageToPixelBuffer(raw, {
+              size,
+              transparentBackground: true,
+              palette: quantizePalette,
+              maxColors,
+            }),
+          );
+        }
+        created.push({
+          id: `${engine}-${Date.now()}-${v}`,
+          prompt: text,
+          frames,
+          engine,
+        });
       }
       setResults((prev) => [...created, ...prev].slice(0, 12));
     } catch (e) {
@@ -304,9 +382,230 @@ export function GenPanel() {
           onChange={(e) => setEngine(e.target.value as EngineId)}
         >
           <option value="local">Générateur local (hors-ligne, gratuit)</option>
+          <option value="server">Serveur IA local (ComfyUI / A1111)</option>
           <option value="ai">IA en ligne (clé API requise)</option>
         </select>
       </label>
+
+      {engine === 'server' && (
+        <div className="server-box">
+          <label className="field">
+            <span>Serveur</span>
+            <select
+              value={server.engine}
+              onChange={(e) => {
+                const kind = e.target.value as LocalEngineKind;
+                setServerStatus(null);
+                setServer({
+                  ...server,
+                  engine: kind,
+                  baseUrl: DEFAULT_URLS[kind],
+                  sampler: FALLBACK_SAMPLERS[kind][0],
+                  checkpoint: kind === 'comfyui' ? server.checkpoint : '',
+                });
+              }}
+            >
+              <option value="a1111">Automatic1111 / Forge</option>
+              <option value="comfyui">ComfyUI</option>
+            </select>
+          </label>
+
+          <label className="field">
+            <span>URL du serveur</span>
+            <input
+              type="text"
+              spellCheck={false}
+              value={server.baseUrl}
+              onChange={(e) => patchServer({ baseUrl: e.target.value })}
+            />
+          </label>
+
+          <div className="row gap">
+            <button
+              type="button"
+              className="small"
+              disabled={testing}
+              onClick={() => void testConnection()}
+            >
+              {testing ? 'Test…' : 'Tester la connexion'}
+            </button>
+            {serverStatus && (
+              <span
+                className={`server-status ${serverStatus.ok ? 'ok' : 'ko'}`}
+                title={serverStatus.message}
+              >
+                {serverStatus.ok ? '● connecté' : '● hors ligne'}
+              </span>
+            )}
+          </div>
+
+          {serverStatus && (
+            <div className={`server-message ${serverStatus.ok ? 'ok' : 'ko'}`}>
+              {serverStatus.message}
+            </div>
+          )}
+
+          {serverStatus?.ok &&
+            server.engine === 'a1111' &&
+            serverStatus.activeModel && (
+              <div className="hint">
+                Modèle actif : <strong>{serverStatus.activeModel}</strong> —
+                changez de modèle dans l’interface de votre serveur (chargez
+                votre modèle pixel art, ou SDXL + LoRA).
+              </div>
+            )}
+
+          {server.engine === 'comfyui' && (
+            <>
+              <label className="field">
+                <span>Checkpoint</span>
+                <select
+                  value={server.checkpoint}
+                  onChange={(e) => patchServer({ checkpoint: e.target.value })}
+                >
+                  {server.checkpoint === '' && (
+                    <option value="">— testez la connexion —</option>
+                  )}
+                  {(serverStatus?.models ?? [server.checkpoint])
+                    .filter((m) => m.length > 0)
+                    .map((model) => (
+                      <option key={model} value={model}>
+                        {model}
+                      </option>
+                    ))}
+                </select>
+              </label>
+
+              <div className="row gap">
+                <label className="field grow">
+                  <span>Sampler</span>
+                  <select
+                    value={server.sampler}
+                    onChange={(e) => patchServer({ sampler: e.target.value })}
+                  >
+                    {(serverStatus?.samplers ?? FALLBACK_SAMPLERS.comfyui).map(
+                      (s) => (
+                        <option key={s} value={s}>
+                          {s}
+                        </option>
+                      ),
+                    )}
+                  </select>
+                </label>
+                <label className="field grow">
+                  <span>Planificateur</span>
+                  <select
+                    value={server.scheduler}
+                    onChange={(e) => patchServer({ scheduler: e.target.value })}
+                  >
+                    {(serverStatus?.schedulers ?? SCHEDULERS).map((s) => (
+                      <option key={s} value={s}>
+                        {s}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+            </>
+          )}
+
+          {server.engine === 'a1111' && (
+            <div className="row gap">
+              <label className="field grow">
+                <span>Sampler</span>
+                <input
+                  type="text"
+                  spellCheck={false}
+                  value={server.sampler}
+                  onChange={(e) => patchServer({ sampler: e.target.value })}
+                />
+              </label>
+              <label className="field grow">
+                <span>LoRA pixel art</span>
+                <input
+                  type="text"
+                  spellCheck={false}
+                  placeholder="pixel-art-xl"
+                  value={server.lora}
+                  onChange={(e) => patchServer({ lora: e.target.value })}
+                />
+              </label>
+            </div>
+          )}
+
+          <label className="field">
+            <span>Prompt négatif</span>
+            <textarea
+              rows={2}
+              spellCheck={false}
+              value={server.negativePrompt}
+              placeholder={DEFAULT_NEGATIVE_PROMPT}
+              onChange={(e) => patchServer({ negativePrompt: e.target.value })}
+            />
+          </label>
+
+          <div className="row gap">
+            <label className="field grow">
+              <span>Étapes : {server.steps}</span>
+              <input
+                className="slider"
+                type="range"
+                min={4}
+                max={60}
+                value={server.steps}
+                onChange={(e) => patchServer({ steps: Number(e.target.value) })}
+              />
+            </label>
+            <label className="field grow">
+              <span>CFG</span>
+              <input
+                type="number"
+                min={1}
+                max={20}
+                step={0.5}
+                value={server.cfgScale}
+                onChange={(e) => patchServer({ cfgScale: Number(e.target.value) })}
+              />
+            </label>
+          </div>
+
+          <label className="field">
+            <span>Résolution du modèle</span>
+            <select
+              value={server.resolution}
+              onChange={(e) =>
+                patchServer({ resolution: Number(e.target.value) })
+              }
+            >
+              <option value={512}>512 × 512 (SD 1.5)</option>
+              <option value={768}>768 × 768</option>
+              <option value={1024}>1024 × 1024 (SDXL / Flux)</option>
+            </select>
+          </label>
+
+          <label className="check-row">
+            <input
+              type="checkbox"
+              checked={useDocPalette}
+              onChange={(e) => setUseDocPalette(e.target.checked)}
+            />
+            Quantifier vers la palette du document
+          </label>
+
+          <div className="hint">
+            Activez l’API et le CORS sur votre serveur :
+            <br />
+            <code>
+              {server.engine === 'a1111'
+                ? './webui.sh --api --cors-allow-origins=*'
+                : 'python main.py --enable-cors-header'}
+            </code>
+            <br />
+            Astuce : chargez un modèle pixel art (ex. <em>pixel-art-xl</em>,
+            <em> PixelArt-Diffusion</em>) ou ajoutez une LoRA pour un rendu net.
+          </div>
+        </div>
+      )}
 
       {engine === 'ai' && (
         <>
@@ -360,7 +659,7 @@ export function GenPanel() {
           <div key={result.id} className="result-card">
             <ResultThumb frames={result.frames} />
             <div className="result-meta">
-              <span className="badge">{result.engine === 'ai' ? 'IA' : 'Local'}</span>
+              <span className="badge">{ENGINE_LABELS[result.engine]}</span>
               {result.frames.length > 1 && (
                 <span className="badge">{result.frames.length} img</span>
               )}

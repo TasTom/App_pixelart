@@ -22,6 +22,15 @@ function base64ToBytes(b64: string): Uint8Array {
   return bytes;
 }
 
+/** Convertit une image base64 (avec ou sans préfixe data:) en Blob PNG. */
+export function base64ImageToBlob(b64: string): Blob {
+  const clean = b64.includes(',') ? b64.slice(b64.indexOf(',') + 1) : b64;
+  const bytes = base64ToBytes(clean.trim());
+  const copy = new Uint8Array(bytes.byteLength);
+  copy.set(bytes);
+  return new Blob([copy.buffer], { type: 'image/png' });
+}
+
 /** Décode un blob image en pixels RGBA exploitables. */
 export async function blobToRawImage(blob: Blob): Promise<RawImage> {
   const bitmap = await createImageBitmap(blob);
@@ -93,10 +102,7 @@ export async function generateWithAi(options: AiOptions): Promise<RawImage> {
   const item = json.data?.[0];
   let blob: Blob;
   if (item?.b64_json) {
-    const bytes = base64ToBytes(item.b64_json);
-    const copy = new Uint8Array(bytes.byteLength);
-    copy.set(bytes);
-    blob = new Blob([copy.buffer], { type: 'image/png' });
+    blob = base64ImageToBlob(item.b64_json);
   } else if (item?.url) {
     const imgRes = await fetch(item.url, { signal: options.signal });
     if (!imgRes.ok) {

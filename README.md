@@ -1,9 +1,10 @@
 # PixelForge — Éditeur pixel art, animations et tilemaps
 
 PixelForge est une application web pour créer du pixel art professionnel :
-**génération de sprites et d'animations à partir de prompt**, dessin au pixel
-près, calques, animations image par image, tilemaps pour vos jeux vidéo, et
-exports vers tous les formats utiles (PNG, GIF, spritesheet, JSON Tiled).
+**génération de sprites et d'animations à partir de prompt** (moteur local,
+serveur IA local ou API en ligne), dessin au pixel près, calques, animations
+image par image, tilemaps pour vos jeux vidéo, et exports vers tous les
+formats utiles (PNG, GIF, spritesheet, JSON Tiled).
 
 ![stack](https://img.shields.io/badge/React_19-TypeScript-Vite-7c6cf0)
 
@@ -21,9 +22,60 @@ npm run build      # build de production (dossier dist/)
 npm run preview    # sert le build de production
 npm test           # tests unitaires (Vitest)
 npm run lint       # analyse du code (oxlint)
+npm run mock:sd    # serveur de test A1111 + ComfyUI (validation sans GPU)
 ```
 
 ## Fonctionnalités
+
+### ✦ Génération de sprites par prompt (onglet « Génération »)
+- **Décrivez** votre sprite (« un petit dragon bleu avec des ailes »,
+  « chevalier en armure dorée », « épée magique violette »…) : le prompt est
+  analysé (type, couleurs, détails) puis transformé en sprite.
+- **Types reconnus** : personnages et créatures (ailes, cornes, queue,
+  chapeau, arme, bouclier…), animaux, slimes et fantômes, objets (épée,
+  potion, coffre, clé, bouclier, gemme, parchemin, pièce), nature (arbre,
+  rocher, champignon, fleur), bâtiments (maison, tour) et tuiles de terrain
+  (herbe, pierre, eau, sable, neige, lave).
+- **Animations en un clic** : marche, repos, attaque, saut — 2 à 8 images.
+- **Styles** : RPG 16-bit, Game Boy (4 couleurs), NES 8-bit, Arcade néon,
+  Cartoon — ou « Auto » selon le prompt.
+- **Variantes** : jusqu'à 4 résultats par génération. Tailles 16×16 à 64×64.
+- **Trois moteurs** :
+  - *Générateur local* : hors-ligne, gratuit, instantané et reproductible
+    (même prompt + graine ⇒ même sprite) ;
+  - *Serveur IA local* : connexion à **ComfyUI** ou **Automatic1111 / Forge**
+    installé sur votre PC — de vrais modèles open source (SD 1.5, SDXL,
+    Flux + LoRA pixel art), sans clé API et sans envoi de données ;
+  - *IA en ligne* (clé API personnelle, ex. OpenAI `gpt-image-1`,
+    `dall-e-3`) : l'image est automatiquement convertie en pixel art
+    (réduction de taille, suppression de fond, quantification de palette).
+- Chaque résultat s'insère en un clic : **nouveau document** (animation
+  comprise) ou **nouveau calque** dans le document courant.
+
+#### Brancher un serveur IA local (ComfyUI / Automatic1111)
+
+1. Lancez votre serveur avec l'API et le CORS activés :
+
+   | Serveur | Commande de lancement |
+   |---|---|
+   | Automatic1111 / Forge | `./webui.sh --api --cors-allow-origins=*`<br />(Windows : `webui-user.bat` avec `set COMMANDLINE_ARGS=--api --cors-allow-origins=*`) |
+   | ComfyUI | `python main.py --enable-cors-header` |
+
+2. Dans PixelForge : moteur **« Serveur IA local »**, choisissez le type de
+   serveur, vérifiez l'URL (A1111 : `http://127.0.0.1:7860`,
+   ComfyUI : `http://127.0.0.1:8188`), puis cliquez sur
+   **« Tester la connexion »** : les modèles, samplers et planificateurs
+   disponibles sont récupérés automatiquement.
+3. Réglez les paramètres (étapes, CFG, sampler, résolution, prompt négatif)
+   et générez. Pour un rendu pixel art net, chargez un modèle spécialisé
+   (ex. *PixelArt-Diffusion*, ou SDXL + LoRA *pixel-art-xl*) — pour A1111,
+   le champ **LoRA** ajoute automatiquement `<lora:nom:poids>` au prompt.
+
+Seul le prompt enrichi part vers le serveur ; les images reviennent en local
+et sont pixelisées par l'application (fond transparent, palette réduite).
+
+> Pas de GPU sous la main ? `npm run mock:sd` lance un serveur de test qui
+> imite les deux API (A1111 et ComfyUI) pour valider la connexion.
 
 ### Canvas
 - Formats prédéfinis : 16×16, 32×32, 64×64, 128×128, 256×256, 512×512,
@@ -94,6 +146,12 @@ couleurs, réorganisation par clic (primaire) et clic droit (secondaire).
 ```
 src/
 ├── types.ts              # Modèle : Doc, calques, tiles, historique
+├── gen/
+│   ├── prompt.ts         # Analyse du prompt (type, couleurs, style)
+│   ├── procedural.ts     # Génération locale de sprites et animations
+│   ├── pixelate.ts       # Image → pixel art (taille, fond, palette)
+│   ├── localServer.ts    # Serveur IA local (ComfyUI / Automatic1111)
+│   └── ai.ts             # IA en ligne (API compatible OpenAI)
 ├── core/
 │   ├── document.ts       # Création/clonage/redimensionnement du document
 │   ├── drawOps.ts        # Brosse, ligne, rectangle, ellipse, remplissage
@@ -105,16 +163,22 @@ src/
 │   └── paintController.ts# Traits de dessin (avant/après → historique)
 ├── export/exporters.ts   # PNG, spritesheet, GIF, Tiled, projet
 └── components/           # Interface (React)
+scripts/
+└── mock-sd-server.mjs    # Serveur de test A1111 + ComfyUI (sans GPU)
 ```
 
-Les opérations de dessin sont testées par Vitest (31 tests) : remplissage,
-formes, composition, historique, sauvegarde/restauration du projet.
+Les opérations de dessin **et de génération** sont testées par Vitest
+(70 tests) : remplissage, formes, composition, historique,
+sauvegarde/restauration du projet, analyse de prompt, sprites
+déterministes, animations, conversion image → pixel art, payloads et
+workflows des serveurs IA locaux.
 
 ## Pistes d'amélioration
 
+- Connexion LoRA native pour ComfyUI (nœud `LoraLoader`).
+- File d'attente et progression de la génération sur serveur local.
 - Outil sélection : déplacer/copier-coller la zone sélectionnée.
 - Transformation : retournement, rotation, décalage de calque.
 - Mode symétrie (miroir horizontal/vertical).
 - Palette d'animation avec tag/boucles (A/B tags comme Aseprite).
 - Export de tilemaps animées et support du format `LDtk`.
-- Raccourcis personnalisables et thème clair.
