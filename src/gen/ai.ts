@@ -4,15 +4,50 @@
  */
 import type { RawImage } from './pixelate';
 
-export type AiModelId = 'gpt-image-1' | 'gpt-image-1-mini' | 'dall-e-3';
+export const AI_MODELS = [
+  { id: 'gpt-image-2.5-sunburst', label: 'GPT Image 2.5 Sunburst', extendedQuality: true },
+  { id: 'gpt-image-2.5-flare', label: 'GPT Image 2.5 Flare (rapide)', extendedQuality: true },
+  { id: 'gpt-image-2', label: 'GPT Image 2', extendedQuality: false },
+  { id: 'gpt-image-1', label: 'GPT Image 1 (ancien)', extendedQuality: false },
+  { id: 'gpt-image-1-mini', label: 'GPT Image 1 mini (ancien)', extendedQuality: false },
+] as const;
+export type AiModelId = typeof AI_MODELS[number]['id'];
+export type AiQuality = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+export const DEFAULT_AI_MODEL: AiModelId = 'gpt-image-2.5-sunburst';
+
+/** Les anciennes préférences DALL·E ne doivent plus appeler un modèle retiré. */
+export function resolveAiModel(model: unknown): AiModelId {
+  return AI_MODELS.find((entry) => entry.id === model)?.id ?? DEFAULT_AI_MODEL;
+}
+
+export function resolveAiQuality(model: AiModelId, quality: AiQuality = 'high'): AiQuality {
+  if ((quality === 'xhigh' || quality === 'max') &&
+    !AI_MODELS.find((entry) => entry.id === model)?.extendedQuality) return 'high';
+  return quality;
+}
 
 export interface AiOptions {
   apiKey: string;
   /** URL de base (défaut : API OpenAI). Permet un proxy ou un serveur local. */
   baseUrl?: string;
   model?: AiModelId;
+  quality?: AiQuality;
+  transparentBackground?: boolean;
   prompt: string;
   signal?: AbortSignal;
+}
+
+export function buildAiRequest(options: AiOptions): Record<string, unknown> {
+  const model = resolveAiModel(options.model);
+  return {
+    model,
+    prompt: options.prompt,
+    n: 1,
+    size: '1024x1024',
+    quality: resolveAiQuality(model, options.quality),
+    output_format: 'png',
+    background: options.transparentBackground === false ? 'opaque' : 'transparent',
+  };
 }
 
 function base64ToBytes(b64: string): Uint8Array {
@@ -58,17 +93,7 @@ export async function generateWithAi(options: AiOptions): Promise<RawImage> {
     /\/+$/,
     '',
   );
-  const model = options.model ?? 'gpt-image-1';
-
-  const body: Record<string, unknown> = {
-    model,
-    prompt: options.prompt,
-    n: 1,
-    size: '1024x1024',
-  };
-  if (model === 'dall-e-3') {
-    body.response_format = 'b64_json';
-  }
+  const body = buildAiRequest(options);
 
   const res = await fetch(`${base}/images/generations`, {
     method: 'POST',
@@ -91,7 +116,9 @@ export async function generateWithAi(options: AiOptions): Promise<RawImage> {
     if (res.status === 401) {
       message = 'Clé API refusée (401). Vérifiez votre clé.';
     } else if (res.status === 429) {
-      message = 'Quota ou débit dépassé (429). Réessayez plus tard.';
+      message = `Quota ou débit dépassé (429). ${message}`;
+    } else if (res.status === 403) {
+      message = `Accès au modèle refusé (403). Vérifiez les permissions de votre compte. ${message}`;
     }
     throw new Error(message);
   }

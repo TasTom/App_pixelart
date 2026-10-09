@@ -12,6 +12,10 @@ dist
 dist-ssr
 *.local
 
+# Sorties de validation et de débogage (non utilisées par l'application)
+artifacts/
+_*
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

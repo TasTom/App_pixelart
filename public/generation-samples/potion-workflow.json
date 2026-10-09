@@ -1,0 +1,137 @@
+{
+  "promptId": "60c08a3e-4190-4093-8e52-43c6eaca33f8",
+  "prompt": "une potion magique violette dans une fiole de verre ronde avec un bouchon en liège et une étoile dorée sur l’étiquette, vue de face",
+  "seed": 42,
+  "workflow": {
+    "0": {
+      "class_type": "LoraLoaderModelOnly",
+      "inputs": {
+        "model": [
+          "1",
+          0
+        ],
+        "lora_name": "klein-spritesheet-lora.safetensors",
+        "strength_model": 1
+      }
+    },
+    "1": {
+      "class_type": "UnetLoaderGGUF",
+      "inputs": {
+        "unet_name": "flux-2-klein-9b-Q4_K_S.gguf"
+      }
+    },
+    "2": {
+      "class_type": "CLIPLoader",
+      "inputs": {
+        "clip_name": "qwen_3_8b_fp8mixed.safetensors",
+        "type": "flux2",
+        "device": "default"
+      }
+    },
+    "3": {
+      "class_type": "VAELoader",
+      "inputs": {
+        "vae_name": "flux2-vae.safetensors"
+      }
+    },
+    "4": {
+      "class_type": "CLIPTextEncode",
+      "inputs": {
+        "text": "une potion magique violette dans une fiole de verre ronde avec un bouchon en liège et une étoile dorée sur l’étiquette, vue de face\npixel art, 16-bit JRPG style, clean outline, flat colors, limited palette\nthree-quarter top-down view, slight overhead camera angle, orthographic\nA single game sprite composition with all described subjects and accessories fully visible, centered with empty margin. Uniform solid white background, no ground shadow.\nCrisp square pixels of uniform size, intentional pixel clusters, stepped outlines and flat shading, readable at 128 by 128 pixels.\nPreserve the requested colors, object count, pose and viewpoint. No text, watermark, blur or checkerboard.",
+        "clip": [
+          "2",
+          0
+        ]
+      }
+    },
+    "5": {
+      "class_type": "EmptyFlux2LatentImage",
+      "inputs": {
+        "width": 512,
+        "height": 512,
+        "batch_size": 1
+      }
+    },
+    "6": {
+      "class_type": "BasicGuider",
+      "inputs": {
+        "model": [
+          "0",
+          0
+        ],
+        "conditioning": [
+          "4",
+          0
+        ]
+      }
+    },
+    "7": {
+      "class_type": "RandomNoise",
+      "inputs": {
+        "noise_seed": 42
+      }
+    },
+    "8": {
+      "class_type": "KSamplerSelect",
+      "inputs": {
+        "sampler_name": "euler"
+      }
+    },
+    "9": {
+      "class_type": "Flux2Scheduler",
+      "inputs": {
+        "steps": 4,
+        "width": 512,
+        "height": 512
+      }
+    },
+    "10": {
+      "class_type": "SamplerCustomAdvanced",
+      "inputs": {
+        "noise": [
+          "7",
+          0
+        ],
+        "guider": [
+          "6",
+          0
+        ],
+        "sampler": [
+          "8",
+          0
+        ],
+        "sigmas": [
+          "9",
+          0
+        ],
+        "latent_image": [
+          "5",
+          0
+        ]
+      }
+    },
+    "11": {
+      "class_type": "VAEDecode",
+      "inputs": {
+        "samples": [
+          "10",
+          0
+        ],
+        "vae": [
+          "3",
+          0
+        ]
+      }
+    },
+    "12": {
+      "class_type": "SaveImage",
+      "inputs": {
+        "filename_prefix": "pixelforge_flux2",
+        "images": [
+          "11",
+          0
+        ]
+      }
+    }
+  }
+}

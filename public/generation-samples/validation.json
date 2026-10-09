@@ -1,0 +1,80 @@
+{
+  "model": "FLUX.2 Klein 9B GGUF + LoRA spritesheet",
+  "config": {
+    "engine": "comfyui",
+    "baseUrl": "http://127.0.0.1:8188",
+    "steps": 4,
+    "cfgScale": 1,
+    "sampler": "euler",
+    "scheduler": "normal",
+    "resolution": 512,
+    "checkpoint": "",
+    "negativePrompt": "",
+    "lora": "klein-spritesheet-lora.safetensors",
+    "loraWeight": 1,
+    "triggerWords": "",
+    "modelFamily": "flux2-klein",
+    "diffusionModel": "flux-2-klein-9b-Q4_K_S.gguf",
+    "textEncoder": "qwen_3_8b_fp8mixed.safetensors",
+    "vae": "flux2-vae.safetensors"
+  },
+  "cases": [
+    {
+      "id": "dragon",
+      "prompt": "un petit dragon bleu avec deux ailes déployées, des cornes blanches, une longue queue et un ventre jaune, vue de trois quarts",
+      "promptId": "23737d96-6404-422e-af9e-bb678d8c4358",
+      "seed": 42,
+      "seconds": 19,
+      "sizes": [
+        {
+          "size": 64,
+          "colors": 29,
+          "opaquePixels": 1111
+        },
+        {
+          "size": 128,
+          "colors": 48,
+          "opaquePixels": 4407
+        }
+      ]
+    },
+    {
+      "id": "knight",
+      "prompt": "un chevalier en armure dorée, tenant une épée bleue dans une main et un bouclier rouge dans l’autre, casque fermé, personnage entier debout, vue de face",
+      "promptId": "fe8ec4b4-fa02-408a-897c-f69d9ffb35f5",
+      "seed": 42,
+      "seconds": 14,
+      "sizes": [
+        {
+          "size": 64,
+          "colors": 30,
+          "opaquePixels": 1287
+        },
+        {
+          "size": 128,
+          "colors": 45,
+          "opaquePixels": 5082
+        }
+      ]
+    },
+    {
+      "id": "potion",
+      "prompt": "une potion magique violette dans une fiole de verre ronde avec un bouchon en liège et une étoile dorée sur l’étiquette, vue de face",
+      "promptId": "60c08a3e-4190-4093-8e52-43c6eaca33f8",
+      "seed": 42,
+      "seconds": 16,
+      "sizes": [
+        {
+          "size": 64,
+          "colors": 27,
+          "opaquePixels": 1542
+        },
+        {
+          "size": 128,
+          "colors": 47,
+          "opaquePixels": 6104
+        }
+      ]
+    }
+  ]
+}

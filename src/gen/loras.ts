@@ -15,6 +15,11 @@ export interface LoraTrigger {
 
 export const LORA_TRIGGERS: LoraTrigger[] = [
   {
+    match: 'limbicnation-pixel-art',
+    trigger: 'pixel art sprite',
+    note: 'Limbicnation (FLUX.2 Klein 4B)',
+  },
+  {
     match: 'pixarfk',
     trigger: 'pixel art, PixArFK',
     note: 'PixelArtRedmond (SD 1.5)',

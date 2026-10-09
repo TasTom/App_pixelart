@@ -1,0 +1,38 @@
+{
+  "model": "SD 1.5 + PixelArtRedmond",
+  "config": {
+    "engine": "comfyui",
+    "baseUrl": "http://127.0.0.1:8188",
+    "steps": 24,
+    "cfgScale": 7,
+    "sampler": "euler",
+    "scheduler": "normal",
+    "resolution": 512,
+    "checkpoint": "v1-5-pruned-emaonly.safetensors",
+    "negativePrompt": "blurry, smooth gradients, antialiasing, 3d render, photorealistic, photo, text, watermark, signature, multiple views, cropped, jpeg artifacts, low quality, deformed",
+    "lora": "PixelArtRedmond15V-PixelArt-PIXARFK.safetensors",
+    "loraWeight": 0.8,
+    "triggerWords": "pixel art, PixArFK"
+  },
+  "cases": [
+    {
+      "id": "dragon-sd15",
+      "prompt": "un petit dragon bleu avec deux ailes déployées, des cornes blanches, une longue queue et un ventre jaune, vue de trois quarts",
+      "promptId": "c0730237-cb9e-4a6e-b7c1-21b67d52d37a",
+      "seed": 42,
+      "seconds": 28,
+      "sizes": [
+        {
+          "size": 64,
+          "colors": 30,
+          "opaquePixels": 2005
+        },
+        {
+          "size": 128,
+          "colors": 48,
+          "opaquePixels": 7887
+        }
+      ]
+    }
+  ]
+}

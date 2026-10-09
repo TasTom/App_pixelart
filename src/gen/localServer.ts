@@ -11,6 +11,10 @@ export type LocalEngineKind = 'a1111' | 'comfyui';
 
 export interface LocalServerConfig {
   engine: LocalEngineKind;
+  modelFamily?: 'sd' | 'flux2-klein';
+  diffusionModel?: string;
+  textEncoder?: string;
+  vae?: string;
   /** URL du serveur, ex. http://127.0.0.1:7860 (A1111) ou :8188 (ComfyUI). */
   baseUrl: string;
   steps: number;
@@ -52,6 +56,9 @@ export interface ServerStatus {
   schedulers: string[];
   /** ComfyUI : LoRA installées, applicables via un nœud LoraLoader. */
   loras: string[];
+  diffusionModels?: string[];
+  textEncoders?: string[];
+  vaes?: string[];
 }
 
 export interface ComfyImageRef {
@@ -61,7 +68,9 @@ export interface ComfyImageRef {
 }
 
 export const DEFAULT_NEGATIVE_PROMPT =
-  'blurry, smooth gradients, antialiasing, 3d render, photorealistic, photo, text, watermark, signature, multiple views, cropped, jpeg artifacts, low quality, deformed';
+  'blurry, smooth gradients, antialiasing, soft shading, airbrushed, painterly, gradient shading, ' +
+  '3d render, photorealistic, photo, sketch, drawing, canvas texture, film grain, ' +
+  'text, watermark, signature, multiple views, cropped, jpeg artifacts, low quality, deformed';
 
 export const DEFAULT_URLS: Record<LocalEngineKind, string> = {
   a1111: 'http://127.0.0.1:7860',
@@ -98,8 +107,71 @@ export function defaultServerConfig(engine: LocalEngineKind = 'a1111'): LocalSer
   };
 }
 
+/**
+ * Profil FLUX.2 Klein détecté sur cette machine : modèle GGUF 9B quantifié
+ * (chargé via UnetLoaderGGUF), encodeur Qwen 3 8B FP8, VAE FLUX.2 et la LoRA
+ * de spritesheets Klein. 4 étapes Euler suffisent sur ce modèle distillé.
+ *
+ * L'encodeur doit correspondre au modèle : le variant 9B attend une dimension
+ * de texte de 4096 (Qwen 3 8B). Qwen 3 4B (2560) provoque l'erreur
+ * « mat1 and mat2 shapes cannot be multiplied ».
+ */
+export function fluxPixelArtConfig(): LocalServerConfig {
+  return {
+    ...defaultServerConfig('comfyui'),
+    modelFamily: 'flux2-klein',
+    diffusionModel: 'flux-2-klein-9b-Q4_K_S.gguf',
+    textEncoder: 'qwen_3_8b_fp8mixed.safetensors',
+    vae: 'flux2-vae.safetensors',
+    lora: 'klein-spritesheet-lora.safetensors',
+    triggerWords: '',
+    loraWeight: 1,
+    steps: 4,
+    cfgScale: 1,
+    sampler: 'euler',
+    negativePrompt: '',
+  };
+}
+
+export function localConfigError(cfg: LocalServerConfig): string | null {
+  if (cfg.engine !== 'comfyui') return null;
+  if (!loraMatchesFamily(cfg.lora, cfg.modelFamily)) return 'Cette LoRA appartient à une autre famille de modèles. Choisissez une LoRA compatible avec le profil.';
+  if (cfg.modelFamily === 'flux2-klein') {
+    if (!cfg.diffusionModel?.trim() || !cfg.textEncoder?.trim() || !cfg.vae?.trim()) {
+      return 'Sélectionnez le modèle FLUX.2, son encodeur Qwen et son VAE (testez la connexion).';
+    }
+  } else if (!cfg.checkpoint.trim()) {
+    return 'Choisissez un checkpoint ComfyUI (testez la connexion).';
+  }
+  return null;
+}
+
+/** Avoid silently applying the previously installed SD LoRA to a FLUX model. */
+export function loraMatchesFamily(name: string, family: LocalServerConfig['modelFamily']): boolean {
+  const trimmed = name.trim();
+  if (!trimmed) return true;
+  return family === 'flux2-klein'
+    ? !/pixelartredmond|pixarfk|pixel-art-xl|pixel-art-redux|sdxl|illustrious/i.test(trimmed)
+    : !/limbicnation-pixel-art-flux2|flux2-klein|klein-spritesheet/i.test(trimmed);
+}
+
 function base(url: string): string {
   return url.trim().replace(/\/+$/, '') || DEFAULT_URLS.a1111;
+}
+
+/** Lève une erreur si le signal d'annulation est déclenché. */
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new Error('Génération annulée.');
+}
+
+/** Encode des octets en base64 (sans préfixe data:). */
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = '';
+  const size = 0x8000;
+  for (let i = 0; i < bytes.length; i += size) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + size));
+  }
+  return btoa(binary);
 }
 
 function fetchFailed(url: string): Error {
@@ -119,6 +191,36 @@ export function loraToken(lora: string, weight: number): string {
 
 /* ------------------------- Automatic1111 / Forge ------------------------- */
 
+/**
+ * Résolution de génération optimale pour une taille de sprite cible.
+ *
+ * Le modèle doit dessiner à une résolution plus haute que la cible (pour
+ * laisser la place aux détails), mais le rapport doit être un **entier** :
+ * sans cela, la réduction produit des pixels de tailles inégales et des
+ * contours flous. Ex. : cible 48 px → 480 px (×10) et non 512 px (×10,67).
+ *
+ * `native` est la résolution préférée du modèle (512 pour SD 1.5 et
+ * FLUX.2 Klein, 1024 pour SDXL).
+ */
+export function generationResolution(targetSize: number, native = 512): number {
+  const target = Math.max(8, Math.round(targetSize));
+  // Le multiple entier qui se rapproche le plus de la résolution native.
+  let best = target;
+  let bestError = Infinity;
+  for (let scale = 1; scale <= 64; scale++) {
+    const candidate = target * scale;
+    if (candidate > native * 2) break;
+    const error = Math.abs(candidate - native);
+    if (error < bestError) {
+      bestError = error;
+      best = candidate;
+    }
+  }
+  // Les modèles de diffusion exigent des dimensions multiples de 8 (souvent 16).
+  const step = best >= 1024 ? 16 : 8;
+  return Math.max(step, Math.round(best / step) * step);
+}
+
 export interface A1111Payload {
   prompt: string;
   negative_prompt: string;
@@ -132,6 +234,10 @@ export interface A1111Payload {
   n_iter: number;
   restore_faces: boolean;
   tiling: boolean;
+  /** Images de départ en base64 (img2img). */
+  init_images?: string[];
+  /** Force du débruitage en img2img (1 = texte vers image). */
+  denoise_strength?: number;
 }
 
 export function buildA1111Payload(
@@ -176,6 +282,7 @@ export function buildComfyWorkflow(
   cfg: LocalServerConfig,
   params: LocalGenParams,
 ): ComfyWorkflow {
+  if (cfg.modelFamily === 'flux2-klein') return buildFlux2Workflow(cfg, params);
   const loraName = cfg.lora.trim();
   const useLora = loraName.length > 0;
   const modelSource: [string, number] = useLora ? ['0', 0] : ['1', 0];
@@ -241,6 +348,105 @@ export function buildComfyWorkflow(
     };
   }
   return workflow;
+}
+
+function buildFlux2Workflow(cfg: LocalServerConfig, params: LocalGenParams): ComfyWorkflow {
+  const useLora = cfg.lora.trim().length > 0;
+  // Les modèles GGUF (quantifiés) passent par UnetLoaderGGUF, fourni par le
+  // custom node ComfyUI-GGUF ; les safetensors par UNETLoader.
+  const isGguf = /\.gguf$/i.test((cfg.diffusionModel ?? '').trim());
+  const unetNode = isGguf
+    ? { class_type: 'UnetLoaderGGUF', inputs: { unet_name: cfg.diffusionModel } }
+    : { class_type: 'UNETLoader', inputs: { unet_name: cfg.diffusionModel, weight_dtype: 'default' } };
+  const workflow: ComfyWorkflow = {
+    '1': unetNode,
+    '2': { class_type: 'CLIPLoader', inputs: { clip_name: cfg.textEncoder, type: 'flux2', device: 'default' } },
+    '3': { class_type: 'VAELoader', inputs: { vae_name: cfg.vae } },
+    '4': { class_type: 'CLIPTextEncode', inputs: { text: withTriggerWords(params.prompt, cfg.triggerWords), clip: ['2', 0] } },
+    '5': { class_type: 'EmptyFlux2LatentImage', inputs: { width: cfg.resolution, height: cfg.resolution, batch_size: 1 } },
+    // Distilled Klein uses guidance 1; BasicGuider avoids an unused negative encode.
+    '6': { class_type: 'BasicGuider', inputs: { model: useLora ? ['0', 0] : ['1', 0], conditioning: ['4', 0] } },
+    '7': { class_type: 'RandomNoise', inputs: { noise_seed: params.seed } },
+    '8': { class_type: 'KSamplerSelect', inputs: { sampler_name: cfg.sampler } },
+    '9': { class_type: 'Flux2Scheduler', inputs: { steps: Math.max(1, Math.round(cfg.steps)), width: cfg.resolution, height: cfg.resolution } },
+    '10': { class_type: 'SamplerCustomAdvanced', inputs: { noise: ['7', 0], guider: ['6', 0], sampler: ['8', 0], sigmas: ['9', 0], latent_image: ['5', 0] } },
+    '11': { class_type: 'VAEDecode', inputs: { samples: ['10', 0], vae: ['3', 0] } },
+    '12': { class_type: 'SaveImage', inputs: { filename_prefix: 'pixelforge_flux2', images: ['11', 0] } },
+  };
+  if (useLora) {
+    workflow['0'] = { class_type: 'LoraLoaderModelOnly', inputs: { model: ['1', 0], lora_name: cfg.lora.trim(), strength_model: cfg.loraWeight } };
+  }
+  return workflow;
+}
+
+/**
+ * Workflow img2img FLUX.2 : part de l'image précédente et n'applique qu'un
+ * débruitage partiel. C'est ce qui permet de faire évoluer une pose sans
+ * perdre l'identité du personnage.
+ *
+ * `Flux2Scheduler` n'a pas d'entrée `denoise` : on utilise `BasicScheduler`,
+ * qui produit les sigmas à partir d'un taux de débruitage.
+ */
+export function buildFlux2Img2ImgWorkflow(
+  cfg: LocalServerConfig,
+  params: LocalGenParams & { initImage: string; denoise: number },
+): ComfyWorkflow {
+  const useLora = cfg.lora.trim().length > 0;
+  const isGguf = /\.gguf$/i.test((cfg.diffusionModel ?? '').trim());
+  const workflow: ComfyWorkflow = {
+    '1': isGguf
+      ? { class_type: 'UnetLoaderGGUF', inputs: { unet_name: cfg.diffusionModel } }
+      : { class_type: 'UNETLoader', inputs: { unet_name: cfg.diffusionModel, weight_dtype: 'default' } },
+    '2': { class_type: 'CLIPLoader', inputs: { clip_name: cfg.textEncoder, type: 'flux2', device: 'default' } },
+    '3': { class_type: 'VAELoader', inputs: { vae_name: cfg.vae } },
+    '4': { class_type: 'CLIPTextEncode', inputs: { text: withTriggerWords(params.prompt, cfg.triggerWords), clip: ['2', 0] } },
+    '5': { class_type: 'LoadImage', inputs: { image: params.initImage } },
+    '6': { class_type: 'VAEEncode', inputs: { pixels: ['5', 0], vae: ['3', 0] } },
+    '7': {
+      class_type: 'BasicScheduler',
+      inputs: {
+        model: useLora ? ['0', 0] : ['1', 0],
+        scheduler: 'simple',
+        steps: Math.max(1, Math.round(cfg.steps)),
+        denoise: Math.max(0.05, Math.min(1, params.denoise)),
+      },
+    },
+    '8': { class_type: 'BasicGuider', inputs: { model: useLora ? ['0', 0] : ['1', 0], conditioning: ['4', 0] } },
+    '9': { class_type: 'RandomNoise', inputs: { noise_seed: params.seed } },
+    '10': { class_type: 'KSamplerSelect', inputs: { sampler_name: cfg.sampler } },
+    '11': { class_type: 'SamplerCustomAdvanced', inputs: { noise: ['9', 0], guider: ['8', 0], sampler: ['10', 0], sigmas: ['7', 0], latent_image: ['6', 0] } },
+    '12': { class_type: 'VAEDecode', inputs: { samples: ['11', 0], vae: ['3', 0] } },
+    '13': { class_type: 'SaveImage', inputs: { filename_prefix: 'pixelforge_anim', images: ['12', 0] } },
+  };
+  if (useLora) {
+    workflow['0'] = { class_type: 'LoraLoaderModelOnly', inputs: { model: ['1', 0], lora_name: cfg.lora.trim(), strength_model: cfg.loraWeight } };
+  }
+  return workflow;
+}
+
+/** ComfyUI reports execution failures in history even when HTTP returns 200. */
+export function parseComfyError(history: unknown, promptId: string): string | null {
+  if (!history || typeof history !== 'object') return null;
+  const entry = (history as Record<string, { status?: { status_str?: string; completed?: boolean; messages?: unknown[] } }>)[promptId];
+  const status = entry?.status;
+  if (!status) return null;
+  for (const message of status.messages ?? []) {
+    if (!Array.isArray(message)) continue;
+    if (message[0] === 'execution_error') {
+      const detail = message[1] as { exception_message?: string; node_type?: string } | undefined;
+      return `ComfyUI (${detail?.node_type ?? 'génération'}) : ${detail?.exception_message?.trim() ?? 'Erreur du modèle.'}`;
+    }
+    if (message[0] === 'execution_interrupted') return 'Génération interrompue dans ComfyUI.';
+  }
+  return status.status_str === 'error' ? 'ComfyUI a échoué pendant la génération.' : null;
+}
+
+/** Handles both legacy enum arrays and the newer COMBO node schema. */
+export function comfyChoices(info: unknown, node: string, field: string): string[] {
+  const entry = (info as Record<string, { input?: { required?: Record<string, unknown> } }> | null)?.[node]?.input?.required?.[field];
+  if (!Array.isArray(entry)) return [];
+  const values = Array.isArray(entry[0]) ? entry[0] : (entry[1] as { options?: unknown } | undefined)?.options;
+  return Array.isArray(values) ? values.filter((value): value is string => typeof value === 'string') : [];
 }
 
 /** Extrait les références d'images d'une réponse /history/{id}. */
@@ -356,17 +562,8 @@ export async function testLocalServer(
     const checkpoints = (await jsonOrThrow(
       await fetch(`${url}/object_info/CheckpointLoaderSimple`),
       'Checkpoints',
-    )) as {
-      CheckpointLoaderSimple?: {
-        input?: { required?: Record<string, unknown> };
-      };
-    };
-    const ckptEntry =
-      checkpoints?.CheckpointLoaderSimple?.input?.required?.ckpt_name;
-    const ckptList = Array.isArray(ckptEntry) ? ckptEntry[0] : undefined;
-    const models = Array.isArray(ckptList)
-      ? ckptList.filter((m): m is string => typeof m === 'string')
-      : [];
+    ));
+    const models = comfyChoices(checkpoints, 'CheckpointLoaderSimple', 'ckpt_name');
 
     let samplers = FALLBACK_SAMPLERS.comfyui;
     let schedulers = SCHEDULERS;
@@ -374,30 +571,11 @@ export async function testLocalServer(
       const info = (await jsonOrThrow(
         await fetch(`${url}/object_info/KSampler`),
         'Samplers',
-      )) as {
-        KSampler?: {
-          input?: { required?: Record<string, unknown> };
-        };
-      };
-      const req = info?.KSampler?.input?.required;
-      const samplerEntry = req?.sampler_name;
-      const samplerList = Array.isArray(samplerEntry) ? samplerEntry[0] : undefined;
-      if (Array.isArray(samplerList)) {
-        const list = samplerList.filter(
-          (s): s is string => typeof s === 'string',
-        );
-        if (list.length > 0) samplers = list;
-      }
-      const schedulerEntry = req?.scheduler;
-      const schedulerList = Array.isArray(schedulerEntry)
-        ? schedulerEntry[0]
-        : undefined;
-      if (Array.isArray(schedulerList)) {
-        const list = schedulerList.filter(
-          (s): s is string => typeof s === 'string',
-        );
-        if (list.length > 0) schedulers = list;
-      }
+      ));
+      const samplerList = comfyChoices(info, 'KSampler', 'sampler_name');
+      const schedulerList = comfyChoices(info, 'KSampler', 'scheduler');
+      if (samplerList.length) samplers = samplerList;
+      if (schedulerList.length) schedulers = schedulerList;
     } catch {
       // samplers par défaut si /object_info indisponible
     }
@@ -407,23 +585,56 @@ export async function testLocalServer(
       const loraInfo = (await jsonOrThrow(
         await fetch(`${url}/object_info/LoraLoader`),
         'LoRA',
-      )) as { LoraLoader?: { input?: { required?: Record<string, unknown> } } };
-      const entry = loraInfo?.LoraLoader?.input?.required?.lora_name;
-      const list = Array.isArray(entry) ? entry[0] : undefined;
-      if (Array.isArray(list)) {
-        loras = list.filter((l): l is string => typeof l === 'string');
-      }
+      ));
+      loras = comfyChoices(loraInfo, 'LoraLoader', 'lora_name');
     } catch {
       // aucune LoRA installée ou nœud indisponible
     }
 
+    const optionalInfo = async (node: string): Promise<unknown> => {
+      try { return await jsonOrThrow(await fetch(`${url}/object_info/${node}`), node); }
+      catch { return {}; }
+    };
+    const [unet, clip, vae, customSampler, fluxScheduler, fluxLatent, guider, unetGguf] = await Promise.all([
+      optionalInfo('UNETLoader'), optionalInfo('CLIPLoader'), optionalInfo('VAELoader'),
+      optionalInfo('KSamplerSelect'), optionalInfo('Flux2Scheduler'),
+      optionalInfo('EmptyFlux2LatentImage'), optionalInfo('BasicGuider'),
+      optionalInfo('UnetLoaderGGUF'),
+    ]);
+    // Les modèles GGUF (custom node ComfyUI-GGUF) et les safetensors sont
+    // acceptés indifféremment : on fusionne les deux listes.
+    const diffusionModels = Array.from(new Set([
+      ...comfyChoices(unet, 'UNETLoader', 'unet_name'),
+      ...comfyChoices(unetGguf, 'UnetLoaderGGUF', 'unet_name'),
+    ]));
+    const textEncoders = comfyChoices(clip, 'CLIPLoader', 'clip_name');
+    const vaes = comfyChoices(vae, 'VAELoader', 'vae_name');
+    const modernSamplers = comfyChoices(customSampler, 'KSamplerSelect', 'sampler_name');
+    if (modernSamplers.length) samplers = modernSamplers;
+    const missing: string[] = [];
+    if (cfg.modelFamily === 'flux2-klein') {
+      if (!Object.keys(fluxScheduler as object).length || !Object.keys(fluxLatent as object).length || !Object.keys(guider as object).length) {
+        missing.push('nœuds FLUX.2 (mettez ComfyUI à jour)');
+      }
+      if (!diffusionModels.includes(cfg.diffusionModel ?? '')) missing.push(cfg.diffusionModel || 'modèle FLUX.2');
+      if (!textEncoders.includes(cfg.textEncoder ?? '')) missing.push(cfg.textEncoder || 'encodeur Qwen');
+      if (!vaes.includes(cfg.vae ?? '')) missing.push(cfg.vae || 'VAE FLUX.2');
+      if (cfg.lora && !loras.includes(cfg.lora)) missing.push(cfg.lora);
+    }
     return {
-      ok: true,
-      message: `Connecté à ComfyUI (${models.length} checkpoint(s), ${loras.length} LoRA).`,
+      ok: missing.length === 0,
+      message: missing.length
+        ? `ComfyUI connecté, profil incomplet : ${missing.join(', ')}. Installez les fichiers du profil puis retestez.`
+        : cfg.modelFamily === 'flux2-klein'
+          ? 'ComfyUI prêt : FLUX.2 Klein + LoRA de sprites, 4 étapes.'
+          : `Connecté à ComfyUI (${models.length} checkpoint(s), ${loras.length} LoRA).`,
       models,
       samplers,
       schedulers,
       loras,
+      diffusionModels,
+      textEncoders,
+      vaes,
     };
   } catch (err) {
     const message =
@@ -438,16 +649,17 @@ export async function testLocalServer(
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
-    const timer = window.setTimeout(() => {
+    // setTimeout global : fonctionne dans le navigateur comme sous Node.
+    const timer = setTimeout(() => {
       signal?.removeEventListener('abort', onAbort);
       resolve();
     }, ms);
     const onAbort = (): void => {
-      window.clearTimeout(timer);
+      clearTimeout(timer);
       reject(new Error('Génération annulée.'));
     };
     if (signal?.aborted) {
-      window.clearTimeout(timer);
+      clearTimeout(timer);
       reject(new Error('Génération annulée.'));
       return;
     }
@@ -474,10 +686,14 @@ export async function fetchA1111Progress(url: string): Promise<number | null> {
 async function runA1111(
   cfg: LocalServerConfig,
   params: LocalGenParams,
+  /** Image de départ pour l'img2img (animation). */
+  initImage?: Uint8Array | null,
+  /** Force du débruitage (1 = texte vers image, < 1 = img2img). */
+  denoise = 1,
 ): Promise<Blob> {
   const url = base(cfg.baseUrl);
   params.onStatus?.('Envoi au serveur…');
-  const pollTimer = window.setInterval(() => {
+  const pollTimer = setInterval(() => {
     void fetchA1111Progress(url).then((value) => {
       if (value !== null) {
         params.onStatus?.(`Génération ${Math.round(value * 100)} %`, value);
@@ -485,10 +701,16 @@ async function runA1111(
     });
   }, 900);
   try {
+    const payload = buildA1111Payload(cfg, params);
+    // img2img : A1111 accepte l'image de départ et la force de débruitage.
+    if (initImage && denoise < 1) {
+      payload.init_images = [bytesToBase64(initImage)];
+      payload.denoise_strength = denoise;
+    }
     const res = await fetch(`${url}/sdapi/v1/txt2img`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(buildA1111Payload(cfg, params)),
+      body: JSON.stringify(payload),
       signal: params.signal,
     });
     const json = await jsonOrThrow(res, 'Génération');
@@ -499,32 +721,28 @@ async function runA1111(
     params.onStatus?.('Récupération de l’image…');
     return base64ImageToBlob(images[0]);
   } finally {
-    window.clearInterval(pollTimer);
+    clearInterval(pollTimer);
   }
 }
 
-async function runComfyUi(
-  cfg: LocalServerConfig,
-  params: LocalGenParams,
+/** Soumet un workflow ComfyUI et renvoie l'image produite. */
+async function submitComfyWorkflow(
+  url: string,
+  workflow: ComfyWorkflow,
+  signal?: AbortSignal,
+  onStatus?: (text: string) => void,
 ): Promise<Blob> {
-  const url = base(cfg.baseUrl);
-  if (!cfg.checkpoint.trim()) {
-    throw new Error(
-      'Choisissez d’abord un checkpoint ComfyUI (cliquez sur « Tester la connexion »).',
-    );
-  }
-  const workflow = buildComfyWorkflow(cfg, params);
   const clientId =
     typeof crypto !== 'undefined' && 'randomUUID' in crypto
       ? crypto.randomUUID()
       : Math.random().toString(36).slice(2);
 
-  params.onStatus?.('Envoi du workflow…');
+  onStatus?.('Envoi du workflow…');
   const submit = await fetch(`${url}/prompt`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ prompt: workflow, client_id: clientId }),
-    signal: params.signal,
+    signal,
   });
   const submitted = (await jsonOrThrow(submit, 'Soumission du workflow')) as {
     prompt_id?: unknown;
@@ -534,28 +752,26 @@ async function runComfyUi(
   if (!promptId) throw new Error('ComfyUI n’a pas renvoyé d’identifiant de tâche.');
 
   const started = Date.now();
-  const deadline = started + 300_000;
+  const deadline = started + 1_200_000;
   while (Date.now() < deadline) {
     const elapsed = Math.round((Date.now() - started) / 1000);
-    params.onStatus?.(`Serveur en cours (${elapsed} s)…`);
-    await sleep(900, params.signal);
-    const res = await fetch(`${url}/history/${promptId}`, {
-      signal: params.signal,
-    });
+    onStatus?.(`Serveur en cours (${elapsed} s)…`);
+    await sleep(900, signal);
+    const res = await fetch(`${url}/history/${promptId}`, { signal });
     if (!res.ok) continue;
     const history = await res.json();
+    const executionError = parseComfyError(history, promptId);
+    if (executionError) throw new Error(executionError);
     const refs = parseComfyImages(history, promptId);
     const ref = refs[0];
     if (ref) {
-      params.onStatus?.('Récupération de l’image…');
+      onStatus?.('Récupération de l’image…');
       const query = new URLSearchParams({
         filename: ref.filename,
         subfolder: ref.subfolder,
         type: ref.type,
       });
-      const imageRes = await fetch(`${url}/view?${query.toString()}`, {
-        signal: params.signal,
-      });
+      const imageRes = await fetch(`${url}/view?${query.toString()}`, { signal });
       if (!imageRes.ok) {
         throw new Error(`Image introuvable sur ComfyUI (HTTP ${imageRes.status}).`);
       }
@@ -563,6 +779,17 @@ async function runComfyUi(
     }
   }
   throw new Error('Délai dépassé : ComfyUI n’a pas terminé la génération.');
+}
+
+async function runComfyUi(
+  cfg: LocalServerConfig,
+  params: LocalGenParams,
+): Promise<Blob> {
+  const url = base(cfg.baseUrl);
+  const configError = localConfigError(cfg);
+  if (configError) throw new Error(configError);
+  const workflow = buildComfyWorkflow(cfg, params);
+  return submitComfyWorkflow(url, workflow, params.signal, params.onStatus);
 }
 
 /** Lance une génération sur le serveur local et décode le résultat. */
@@ -580,4 +807,108 @@ export async function generateOnLocalServer(
     if (err instanceof TypeError) throw fetchFailed(cfg.baseUrl);
     throw err;
   }
+}
+
+/* ----------------------------- animations -------------------------------- */
+
+export interface LocalAnimationParams {
+  /** Prompt de base décrivant le sujet (sans la pose). */
+  prompt: string;
+  /** Une description de pose par image. */
+  poses: string[];
+  seed: number;
+  signal?: AbortSignal;
+  onStatus?: (text: string, fraction?: number) => void;
+  /**
+   * Force du débruitage en img2img (0-1). Plus elle est basse, plus l'image
+   * reste proche de la précédente : l'animation est stable mais les poses
+   * changent peu. Plus elle est haute, plus les poses bougent, au risque
+   * de perdre l'identité du personnage.
+   */
+  denoise?: number;
+}
+
+/** Envoie une image PNG à ComfyUI et renvoie son nom dans le dossier input. */
+async function uploadComfyImage(
+  url: string,
+  bytes: Uint8Array,
+  filename: string,
+): Promise<string> {
+  const form = new FormData();
+  form.append('image', new Blob([bytes as unknown as BlobPart], { type: 'image/png' }), filename);
+  const res = await fetch(`${url}/upload/image`, { method: 'POST', body: form });
+  if (!res.ok) {
+    throw new Error(`Envoi de l'image à ComfyUI impossible (HTTP ${res.status}).`);
+  }
+  const json = (await res.json()) as { name?: string };
+  return json.name ?? filename;
+}
+
+/**
+ * Génère une animation complète sur le serveur local.
+ *
+ * La première image est créée en txt2img, puis chaque image suivante est
+ * générée en img2img depuis la précédente avec le prompt de sa pose. Cela
+ * conserve l'identité du personnage tout en faisant évoluer la pose — contrairement
+ * à des générations indépendantes, qui donnent des personnages différents.
+ */
+export async function generateAnimationOnLocalServer(
+  cfg: LocalServerConfig,
+  params: LocalAnimationParams,
+): Promise<RawImage[]> {
+  const frames: RawImage[] = [];
+  const total = Math.max(1, params.poses.length);
+  const denoise = params.denoise ?? 0.62;
+
+  if (cfg.engine === 'a1111') {
+    // Automatic1111 accepte init_images + denoise_strength dans txt2img.
+    let previous: Uint8Array | null = null;
+    for (let i = 0; i < total; i++) {
+      throwIfAborted(params.signal);
+      params.onStatus?.(`Image ${i + 1}/${total}…`, i / total);
+      const blob = await runA1111(cfg, {
+        prompt: params.prompt,
+        seed: params.seed + i,
+        signal: params.signal,
+        onStatus: params.onStatus,
+      }, previous, i === 0 ? 1 : denoise);
+      frames.push(await blobToRawImage(blob));
+      previous = new Uint8Array(await blob.arrayBuffer());
+    }
+    return frames;
+  }
+
+  const url = base(cfg.baseUrl);
+  let previous: Uint8Array | null = null;
+
+  for (let i = 0; i < total; i++) {
+    throwIfAborted(params.signal);
+    params.onStatus?.(
+      i === 0 ? `Image 1/${total} (création)…` : `Image ${i + 1}/${total} (animation)…`,
+      i / total,
+    );
+
+    const prompt = i === 0
+      ? `${params.prompt}, ${params.poses[0]}`
+      : `${params.prompt}, ${params.poses[i]}`;
+
+    let blob: Blob;
+    if (i === 0 || !previous) {
+      blob = await runComfyUi(cfg, { prompt, seed: params.seed, signal: params.signal });
+    } else {
+      const initImage = await uploadComfyImage(url, previous, `pixelforge_anim_${Date.now()}.png`);
+      const workflow = buildFlux2Img2ImgWorkflow(cfg, {
+        prompt,
+        seed: params.seed + i,
+        initImage,
+        denoise,
+      });
+      blob = await submitComfyWorkflow(url, workflow, params.signal);
+    }
+    frames.push(await blobToRawImage(blob));
+    previous = new Uint8Array(await blob.arrayBuffer());
+  }
+
+  params.onStatus?.('Animation terminée', 1);
+  return frames;
 }

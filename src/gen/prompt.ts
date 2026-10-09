@@ -29,6 +29,10 @@ export type TerrainSub = 'grass' | 'stone' | 'water' | 'sand' | 'snow' | 'lava';
 
 export type Motion = 'none' | 'walk' | 'idle' | 'attack' | 'jump';
 export type ArtStyle = 'rpg' | 'gameboy' | 'nes' | 'arcade' | 'cartoon';
+export type AssetKind = 'sprite' | 'scene' | 'tile';
+
+/** Vue/cadrage transmissible aux modèles de génération. */
+export type PlView = 'side' | 'low top-down' | 'high top-down';
 
 export interface SpriteFlags {
   wings: boolean;
@@ -55,6 +59,7 @@ export interface PromptTraits {
   /** Teinte dominante 0-360 (issue des mots de couleur ou de l'empreinte). */
   hue: number;
   hueLocked: boolean;
+  colorTone?: 'color' | 'gray' | 'black' | 'white' | 'brown';
   flags: SpriteFlags;
   style: ArtStyle;
   raw: string;
@@ -106,21 +111,25 @@ function tokenize(text: string): WordMatcher {
 }
 
 const COLOR_WORDS: [string[], number][] = [
-  [['rouge', 'rouges'], 2],
+  [['rouge', 'rouges', 'red'], 2],
   [['orange', 'orange'], 28],
-  [['jaune', 'jaunes', 'dore', 'doree', 'dorees', 'gold'], 48],
-  [['vert', 'verte', 'verts', 'vertes'], 120],
+  [['jaune', 'jaunes', 'yellow', 'dore', 'doree', 'dorees', 'gold', 'golden'], 48],
+  [['vert', 'verte', 'verts', 'vertes', 'green'], 120],
   [['cyan', 'turquoise', 'teal'], 178],
-  [['bleu', 'bleue', 'bleus', 'bleues'], 215],
-  [['violet', 'violette', 'violets', 'violettes', 'mauve', 'indigo'], 270],
-  [['rose', 'roses', 'magenta', 'fuchsia'], 330],
-  [['marron', 'brun', 'brune'], 24],
+  [['bleu', 'bleue', 'bleus', 'bleues', 'blue'], 215],
+  [['violet', 'violette', 'violets', 'violettes', 'mauve', 'indigo', 'purple'], 270],
+  [['rose', 'roses', 'magenta', 'fuchsia', 'pink'], 330],
+  [['marron', 'brun', 'brune', 'brown'], 24],
+  [['gris', 'grise', 'gray', 'grey', 'argent', 'silver'], 0],
+  [['noir', 'noire', 'black'], 0],
+  [['blanc', 'blanche', 'white'], 0],
 ];
 
 type SubRule = ItemSub | NatureSub | BuildingSub | TerrainSub | 'none';
 
-// Ordre de priorité : objets → bâtiments → blobs → nature → terrain → animaux.
+// Le premier sujet nommé prime sur ses accessoires et son environnement.
 const KIND_RULES: [SpriteKind, SubRule, string[]][] = [
+  ['biped', 'none', ['chevalier', 'knight', 'guerrier', 'warrior', 'mage', 'sorcier', 'wizard', 'sorciere', 'witch', 'elfe', 'elf', 'personnage', 'character', 'robot', 'pirate', 'ninja', 'samourai', 'paladin', 'archer', 'princesse', 'princess', 'roi', 'king', 'demon', 'zombie', 'squelette', 'skeleton', 'vampire', 'astronaute', 'astronaut', 'humain', 'human']],
   ['item', 'sword', ['epee', 'sword', 'katana', 'dague', 'dagger', 'hache', 'axe', 'baton', 'staff', 'sceptre', 'lance', 'spear', 'arme', 'weapon']],
   ['item', 'potion', ['potion', 'fiole', 'flacon', 'bouteille', 'bottle', 'elixir', 'poison']],
   ['item', 'chest', ['coffre', 'chest', 'tresor', 'treasure']],
@@ -152,7 +161,7 @@ const STYLE_RULES: [ArtStyle, string[]][] = [
   ['cartoon', ['cartoon', 'mignon', 'cute', 'kawaii', 'pastel', 'chibi']],
 ];
 
-const STYLE_GAMEBOY = ['gameboy', 'game'];
+const STYLE_GAMEBOY = ['gameboy', 'game boy'];
 const STYLE_NES = ['8bit', 'nes', 'retro', 'classique', 'atari', 'famicom'];
 
 const FLAG_WORDS: [keyof SpriteFlags, string[]][] = [
@@ -198,26 +207,49 @@ function emptyFlags(): SpriteFlags {
 /** Analyse le prompt et en extrait les traits de génération. */
 export function analyzePrompt(prompt: string): PromptTraits {
   const w = tokenize(prompt);
+  const normalized = normalize(prompt);
+  const firstMention = (words: string[]): number => {
+    let first = Infinity;
+    for (const word of words) {
+      const match = new RegExp(`\\b${word}(?:s|x)?\\b`).exec(normalized);
+      if (match) first = Math.min(first, match.index);
+    }
+    return first;
+  };
   const flags = emptyFlags();
 
   let kind: SpriteKind = 'biped';
   let sub: PromptTraits['sub'] = 'none';
+  let subjectPosition = Infinity;
   for (const [k, s, words] of KIND_RULES) {
-    if (w.any(words)) {
+    const position = firstMention(words);
+    if (position < subjectPosition) {
       kind = k;
       sub = s;
-      break;
+      subjectPosition = position;
     }
+  }
+  if (kind === 'terrain') {
+    // « tuile d'eau » : tuile indique le format, eau indique la matière.
+    const material = KIND_RULES.find(([k, s, words]) =>
+      k === 'terrain' && s !== 'grass' && w.any(words),
+    );
+    if (material) sub = material[1];
   }
 
   // Couleur dominante
   let hue = 0;
   let hueLocked = false;
+  let colorPosition = Infinity;
+  let colorTone: PromptTraits['colorTone'] = 'color';
   for (const [words, h] of COLOR_WORDS) {
-    if (w.any(words)) {
+    const position = firstMention(words);
+    if (position < colorPosition) {
       hue = h;
       hueLocked = true;
-      break;
+      colorPosition = position;
+      colorTone = words[0] === 'gris' ? 'gray' : words[0] === 'noir' ? 'black'
+        : words[0] === 'blanc' ? 'white' : words[0] === 'marron' ? 'brown' : 'color';
     }
   }
 
@@ -236,9 +268,61 @@ export function analyzePrompt(prompt: string): PromptTraits {
   // Détails
   for (const [flag, words] of FLAG_WORDS) {
     flags[flag] = w.any(words);
+    const negated = words.some((word) => new RegExp(
+      `\\b(?:sans|without|no|pas de|pas d|aucun|aucune)\\s+(?:de\\s+)?${word}(?:s|x)?\\b`,
+    ).test(normalized));
+    if (negated) flags[flag] = false;
   }
 
-  return { kind, sub, hue, hueLocked, flags, style, raw: prompt };
+  return { kind, sub, hue, hueLocked, colorTone, flags, style, raw: prompt };
+}
+
+/** Suggestions de prompts affichées sous la zone de saisie. */
+export const PROMPT_EXAMPLES: string[] = [
+  'un petit dragon bleu avec des ailes',
+  'chevalier en armure dorée avec épée et bouclier',
+  'slime vert mignon',
+  'épée magique violette',
+  'coffre au trésor en bois',
+  'arbre de forêt',
+  'potion de soin rouge',
+  'maison de village en pierre',
+  'tileset herbe et terre',
+  'tuile de rocher vue de dessus',
+];
+
+/** Format automatique : les décors et les terrains gardent leur fond. */
+export function inferAssetKind(prompt: string): AssetKind {
+  const w = tokenize(prompt);
+  if (w.any(['paysage', 'landscape', 'scene', 'panorama', 'decor', 'background', 'arriere-plan'])) return 'scene';
+  return analyzePrompt(prompt).kind === 'terrain' ? 'tile' : 'sprite';
+}
+
+export interface AiPromptOptions {
+  size?: number;
+  maxColors?: number;
+  assetKind?: AssetKind;
+  transparentBackground?: boolean;
+  provider?: 'ai' | 'server' | 'flux2';
+  /** Vue/cadrage souhaité (les modèles locaux n'ont pas de paramètre dédié). */
+  view?: 'side' | 'low top-down' | 'high top-down';
+}
+
+/** Cadrage explicite : les modèles locaux doivent être guidés sur la caméra. */
+const VIEW_WORDS: Record<NonNullable<AiPromptOptions['view']>, string> = {
+  'high top-down': 'viewed from directly above, top-down camera angle, orthographic',
+  'low top-down': 'three-quarter top-down view, slight overhead camera angle, orthographic',
+  side: 'side view, profile, horizontal camera angle',
+};
+
+/** Mots indiquant une projection isométrique (ni top-down ni de côté). */
+const ISOMETRIC_WORDS = ['isometrique', 'isometric', 'iso'];
+
+/** Vue par défaut selon le format d'asset et le prompt. */
+function defaultView(asset: AssetKind, prompt: string): NonNullable<AiPromptOptions['view']> {
+  const normalized = prompt.toLowerCase();
+  if (ISOMETRIC_WORDS.some((word) => normalized.includes(word))) return 'side';
+  return asset === 'tile' ? 'high top-down' : 'low top-down';
 }
 
 /**
@@ -251,13 +335,14 @@ export function buildAiPrompt(
   motion: Motion,
   frameIndex: number,
   frameCount: number,
+  options: AiPromptOptions = {},
 ): string {
   const styleWords: Record<ArtStyle, string> = {
-    rpg: 'pixel art, 16-bit JRPG sprite, clean bold outline, flat colors, limited palette',
+    rpg: 'pixel art, 16-bit JRPG style, clean outline, flat colors, limited palette',
     gameboy: 'game boy style pixel art, 4 green tones only, chunky pixels, clean outline',
-    nes: '8-bit NES style pixel art sprite, limited colors, chunky pixels, clean silhouette',
+    nes: '8-bit NES style pixel art, limited colors, chunky pixels, clean silhouette',
     arcade: 'neon arcade pixel art, vivid saturated colors, glowing accents, clean outline',
-    cartoon: 'cute cartoon pixel art sprite, soft pastel colors, rounded shapes, clean outline',
+    cartoon: 'cartoon pixel art, rounded shapes, clean outline, preserve requested colors',
   };
   const motionWords: Record<Motion, string> = {
     none: '',
@@ -271,9 +356,101 @@ export function buildAiPrompt(
       ? `animation frame ${frameIndex + 1} of ${frameCount}, consistent character design, `
       : '';
 
-  return (
-    `${prompt}, ${frame}${styleWords[style]}, game asset sprite, ` +
-    `single subject centered, full body visible, plain solid background, ` +
-    `no text, no watermark, no border ${motionWords[motion]}`
-  );
+  const asset = options.assetKind ?? inferAssetKind(prompt);
+  const transparent = options.transparentBackground ?? asset === 'sprite';
+  const view = options.view ?? defaultView(asset, prompt);
+  if (options.provider === 'flux2') {
+    return [
+      prompt.trim(),
+      styleWords[style],
+      VIEW_WORDS[view],
+      asset === 'sprite'
+        ? `A single game sprite composition with all described subjects and accessories fully visible, centered with empty margin. ${transparent ? 'Uniform solid white background, no ground shadow.' : 'Background as described.'}`
+        : asset === 'tile' ? 'A seamless tileable game texture, filling the whole square.' : 'A complete pixel art scene with the described background.',
+      `Crisp square pixels of uniform size, intentional pixel clusters, stepped outlines and flat shading${options.size ? `, readable at ${options.size} by ${options.size} pixels` : ''}.`,
+      'Preserve the requested colors, object count, pose and viewpoint. No text, watermark, blur or checkerboard.',
+      `${frame}${motionWords[motion]}`,
+    ].filter(Boolean).join('\n');
+  }
+  const spriteBackground = transparent
+    ? options.provider === 'server' ? 'plain solid background' : 'transparent background'
+    : 'background as described';
+  const composition = asset === 'sprite'
+    ? `game asset sprite, ${VIEW_WORDS[view]}, center the described subjects, entire silhouettes visible, small empty margin, ${spriteBackground}`
+    : asset === 'tile'
+      ? `seamless tileable game texture, ${VIEW_WORDS[view]}, edge-to-edge, preserve requested viewpoint`
+      : `complete pixel art scene, ${VIEW_WORDS[view]}, preserve all subjects and the described background`;
+  const compact = `${prompt.trim()}, ${styleWords[style]}, ${composition}, ${frame}${motionWords[motion]}, crisp pixel clusters, uniform pixel size, no antialiasing, no watermark`;
+  // CLIP des modèles SD classiques : ne pas noyer le sujet sous des instructions.
+  if (options.provider === 'server') return compact;
+  return [
+    `Create pixel art faithfully depicting this description: ${prompt.trim()}`,
+    'Preserve the specified subject, object count, colors, accessories, pose and viewpoint. Do not replace the subject with an accessory. Follow explicit exclusions. Style must not override requested colors.',
+    styleWords[style],
+    VIEW_WORDS[view],
+    composition,
+    options.size ? `Design on a logical ${options.size} x ${options.size} pixel grid, enlarged with nearest-neighbor. Make details readable at this resolution using intentional pixel clusters, stepped contours and flat shading.` : '',
+    options.maxColors ? `Use at most ${options.maxColors} distinct colors. Prioritize the requested colors and a readable silhouette.` : '',
+    'No blur, smooth gradients, antialiasing, photorealism or 3D rendering. No labels, watermark or decorative frame. Render text only if explicitly requested.',
+    transparent ? 'Use a genuinely transparent background with an alpha channel. Never draw a checkerboard to imitate transparency.' : '',
+    `${frame}${motionWords[motion]}`,
+  ].filter(Boolean).join('\n');
 }
+
+/**
+ * Description de la pose d'une image d'animation.
+ *
+ * Les modèles locaux ne comprennent pas « image 2 sur 4 » : il faut décrire
+ * la pose elle-même. Chaque image est ensuite générée en img2img depuis la
+ * précédente, ce qui conserve l'identité du personnage.
+ */
+export function animationPose(
+  motion: Motion,
+  frameIndex: number,
+  frameCount: number,
+): string {
+  const n = Math.max(1, frameCount);
+  const i = ((frameIndex % n) + n) % n;
+  switch (motion) {
+    case 'walk': {
+      // Cycle de marche : contact, passage, contact inverse, passage.
+      const phases = [
+        'walking cycle contact pose, front leg extended forward, back leg extended backward, arms swinging opposite to the legs',
+        'walking cycle passing pose, legs crossing under the body with the front leg lifting, body at its highest point',
+        'walking cycle contact pose, front leg extended backward, back leg extended forward, arms swinging opposite to the legs',
+        'walking cycle passing pose, legs crossing under the body with the back leg lifting, body at its highest point',
+      ];
+      return phases[i % phases.length];
+    }
+    case 'idle': {
+      const phases = [
+        'idle standing pose, relaxed, arms at sides, body upright',
+        'idle breathing pose, body slightly lowered, subtle rise and fall of the chest',
+        'idle standing pose, relaxed, arms slightly away from the body',
+        'idle breathing pose, body slightly raised, subtle rise and fall of the chest',
+      ];
+      return phases[i % phases.length];
+    }
+    case 'attack': {
+      const phases = [
+        'attack wind-up pose, weapon raised high behind the body, leaning back',
+        'attack strike pose, weapon swung forward at full extension, leaning forward',
+        'attack follow-through pose, weapon low in front, body recovered',
+        'attack recovery pose, returning to a neutral standing position',
+      ];
+      return phases[i % phases.length];
+    }
+    case 'jump': {
+      const phases = [
+        'jump anticipation pose, crouched low with knees bent, coiled ready to leap',
+        'jump launch pose, legs fully extended, body stretching upward',
+        'jump apex pose, body at the highest point, legs tucked slightly',
+        'jump landing pose, knees bent absorbing the impact, body lowered',
+      ];
+      return phases[i % phases.length];
+    }
+    default:
+      return 'neutral standing pose';
+  }
+}
+

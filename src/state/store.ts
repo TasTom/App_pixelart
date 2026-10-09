@@ -26,6 +26,7 @@ import {
   HISTORY_LIMIT,
 } from '../core/history';
 import { blitBuffer, createPixelBuffer, clonePixelBuffer } from '../utils/pixels';
+import type { GenEngine } from '../gen/runner';
 
 export interface EditorUi {
   tool: ToolId;
@@ -52,7 +53,7 @@ export interface EditorUi {
 export interface GenJob {
   id: string;
   prompt: string;
-  engine: 'local' | 'server' | 'ai';
+  engine: GenEngine;
   status: 'queued' | 'running' | 'done' | 'error' | 'cancelled';
   /** Avancement 0-1. */
   progress: number;
@@ -64,7 +65,7 @@ export interface GeneratedSprite {
   id: string;
   prompt: string;
   frames: PixelBuffer[];
-  engine: 'local' | 'server' | 'ai';
+  engine: GenEngine;
 }
 
 export interface EditorState extends EditorUi {

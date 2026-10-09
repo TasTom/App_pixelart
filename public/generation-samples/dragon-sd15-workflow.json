@@ -1,0 +1,107 @@
+{
+  "promptId": "c0730237-cb9e-4a6e-b7c1-21b67d52d37a",
+  "prompt": "un petit dragon bleu avec deux ailes déployées, des cornes blanches, une longue queue et un ventre jaune, vue de trois quarts",
+  "seed": 42,
+  "workflow": {
+    "0": {
+      "class_type": "LoraLoader",
+      "inputs": {
+        "lora_name": "PixelArtRedmond15V-PixelArt-PIXARFK.safetensors",
+        "strength_model": 0.8,
+        "strength_clip": 0.8,
+        "model": [
+          "1",
+          0
+        ],
+        "clip": [
+          "1",
+          1
+        ]
+      }
+    },
+    "1": {
+      "class_type": "CheckpointLoaderSimple",
+      "inputs": {
+        "ckpt_name": "v1-5-pruned-emaonly.safetensors"
+      }
+    },
+    "2": {
+      "class_type": "EmptyLatentImage",
+      "inputs": {
+        "width": 512,
+        "height": 512,
+        "batch_size": 1
+      }
+    },
+    "3": {
+      "class_type": "CLIPTextEncode",
+      "inputs": {
+        "text": "pixel art, PixArFK, un petit dragon bleu avec deux ailes déployées, des cornes blanches, une longue queue et un ventre jaune, vue de trois quarts, pixel art, 16-bit JRPG style, clean outline, flat colors, limited palette, game asset sprite, center the described subjects, entire silhouettes visible, small empty margin, plain solid background, , crisp pixel clusters, no antialiasing, no watermark",
+        "clip": [
+          "0",
+          1
+        ]
+      }
+    },
+    "4": {
+      "class_type": "CLIPTextEncode",
+      "inputs": {
+        "text": "blurry, smooth gradients, antialiasing, 3d render, photorealistic, photo, text, watermark, signature, multiple views, cropped, jpeg artifacts, low quality, deformed",
+        "clip": [
+          "0",
+          1
+        ]
+      }
+    },
+    "5": {
+      "class_type": "KSampler",
+      "inputs": {
+        "seed": 42,
+        "steps": 24,
+        "cfg": 7,
+        "sampler_name": "euler",
+        "scheduler": "normal",
+        "denoise": 1,
+        "model": [
+          "0",
+          0
+        ],
+        "positive": [
+          "3",
+          0
+        ],
+        "negative": [
+          "4",
+          0
+        ],
+        "latent_image": [
+          "2",
+          0
+        ]
+      }
+    },
+    "6": {
+      "class_type": "VAEDecode",
+      "inputs": {
+        "samples": [
+          "5",
+          0
+        ],
+        "vae": [
+          "1",
+          2
+        ]
+      }
+    },
+    "7": {
+      "class_type": "SaveImage",
+      "inputs": {
+        "filename_prefix": "pixelforge",
+        "images": [
+          "6",
+          0
+        ]
+      }
+    }
+  }
+}

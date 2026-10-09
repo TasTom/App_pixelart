@@ -8,6 +8,9 @@
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "mock:sd": "node scripts/mock-sd-server.mjs",
+    "comfy": "node scripts/start-comfy.mjs",
+    "check:pixel-model": "node scripts/check-pixel-model.mjs",
+    "validate:pixel-model": "node scripts/validate-pixel-model.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "preview": "vite preview"

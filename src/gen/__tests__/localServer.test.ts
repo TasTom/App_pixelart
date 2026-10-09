@@ -2,7 +2,13 @@ import { describe, expect, it } from 'vitest';
 import {
   buildA1111Payload,
   buildComfyWorkflow,
+  buildFlux2Img2ImgWorkflow,
   defaultServerConfig,
+  fluxPixelArtConfig,
+  generationResolution,
+  localConfigError,
+  comfyChoices,
+  parseComfyError,
   loraToken,
   parseA1111Images,
   parseComfyImages,
@@ -22,9 +28,37 @@ const cfgComfy = {
   resolution: 1024,
 };
 
+describe('generationResolution', () => {
+  it('choisit un multiple entier de la taille cible', () => {
+    for (const size of [16, 24, 32, 48, 64, 128, 256]) {
+      const resolution = generationResolution(size);
+      expect(resolution % size).toBe(0);
+    }
+  });
+
+  it('se rapproche de la résolution native du modèle', () => {
+    expect(generationResolution(32)).toBe(512);
+    expect(generationResolution(64)).toBe(512);
+    expect(generationResolution(128)).toBe(512);
+    // 48 ne peut pas atteindre 512 avec un multiple entier : 528 (×11) est le plus proche.
+    expect(generationResolution(48)).toBe(528);
+    expect(generationResolution(24)).toBe(504);
+  });
+
+  it('respecte les contraintes des modèles de diffusion', () => {
+    for (const size of [16, 24, 32, 48, 64, 128, 256]) {
+      expect(generationResolution(size) % 8).toBe(0);
+    }
+  });
+
+  it('accepte une résolution native différente (SDXL)', () => {
+    expect(generationResolution(64, 1024)).toBe(1024);
+    expect(generationResolution(128, 1024)).toBe(1024);
+  });
+});
+
 describe('loraToken', () => {
-  it('ajoute la balise LoRA avec le poids', () => {
-    expect(loraToken('pixel-art-xl', 0.8)).toBe(' <lora:pixel-art-xl:0.8>');
+  it('ajoute la balise LoRA avec le poids', () => {    expect(loraToken('pixel-art-xl', 0.8)).toBe(' <lora:pixel-art-xl:0.8>');
   });
 
   it('retire l’extension du fichier', () => {
@@ -172,5 +206,108 @@ describe('parseComfyImages', () => {
     expect(parseComfyImages(history, 'p')).toEqual([
       { filename: 'a.png', subfolder: '', type: 'output' },
     ]);
+  });
+});
+
+describe('profil natif FLUX.2 Klein', () => {
+  it('utilise les loaders séparés et les latents FLUX.2, pas le workflow SD', () => {
+    const cfg = fluxPixelArtConfig();
+    const wf = buildComfyWorkflow(cfg, { prompt: 'dragon bleu avec deux ailes', seed: 42 });
+    expect(wf['1'].inputs.unet_name).toBe(cfg.diffusionModel);
+    expect(wf['2'].inputs).toEqual({ clip_name: cfg.textEncoder, type: 'flux2', device: 'default' });
+    expect(wf['3'].inputs.vae_name).toBe(cfg.vae);
+    expect(wf['5'].class_type).toBe('EmptyFlux2LatentImage');
+    expect(wf['9'].class_type).toBe('Flux2Scheduler');
+    expect(wf['9'].inputs.steps).toBe(4);
+    expect(wf['7'].inputs.noise_seed).toBe(42);
+    expect(wf['6'].class_type).toBe('BasicGuider');
+    expect(Object.values(wf).some((node) => node.class_type === 'CheckpointLoaderSimple')).toBe(false);
+    expect(Object.values(wf).some((node) => node.inputs.text === cfg.negativePrompt)).toBe(false);
+  });
+
+  it('applique la LoRA au modèle, garde Qwen intact et décode avec le bon VAE', () => {
+    const wf = buildComfyWorkflow(fluxPixelArtConfig(), { prompt: 'dragon bleu', seed: 1 });
+    expect(wf['0'].class_type).toBe('LoraLoaderModelOnly');
+    expect(wf['0'].inputs.strength_model).toBe(1);
+    expect(wf['6'].inputs.model).toEqual(['0', 0]);
+    expect(wf['4'].inputs.clip).toEqual(['2', 0]);
+    expect(wf['4'].inputs.text).toBe('dragon bleu');
+    expect(wf['10'].inputs.sigmas).toEqual(['9', 0]);
+    expect(wf['10'].inputs.latent_image).toEqual(['5', 0]);
+    expect(wf['11'].inputs.vae).toEqual(['3', 0]);
+  });
+
+  it('charge un modèle GGUF via UnetLoaderGGUF', () => {
+    const cfg = fluxPixelArtConfig();
+    expect(cfg.diffusionModel).toMatch(/\.gguf$/i);
+    const wf = buildComfyWorkflow(cfg, { prompt: 'dragon bleu', seed: 1 });
+    expect(wf['1'].class_type).toBe('UnetLoaderGGUF');
+    expect(wf['1'].inputs).toEqual({ unet_name: cfg.diffusionModel });
+  });
+
+  it('garde UNETLoader pour un modèle safetensors', () => {
+    const cfg = { ...fluxPixelArtConfig(), diffusionModel: 'flux-2-klein-4b-fp8.safetensors' };
+    const wf = buildComfyWorkflow(cfg, { prompt: 'dragon bleu', seed: 1 });
+    expect(wf['1'].class_type).toBe('UNETLoader');
+    expect(wf['1'].inputs.weight_dtype).toBe('default');
+  });
+});
+
+describe('workflow img2img FLUX.2', () => {
+  it('encode les latents depuis l’image et applique un débruitage partiel', () => {
+    const wf = buildFlux2Img2ImgWorkflow(fluxPixelArtConfig(), {
+      prompt: 'dragon bleu',
+      seed: 7,
+      initImage: 'anim_prev.png',
+      denoise: 0.62,
+    });
+    expect(wf['5'].class_type).toBe('LoadImage');
+    expect(wf['5'].inputs.image).toBe('anim_prev.png');
+    expect(wf['6'].class_type).toBe('VAEEncode');
+    expect(wf['6'].inputs.pixels).toEqual(['5', 0]);
+    // Flux2Scheduler n'a pas de denoise : BasicScheduler le fournit.
+    expect(wf['7'].class_type).toBe('BasicScheduler');
+    expect(wf['7'].inputs.denoise).toBe(0.62);
+    expect(wf['11'].inputs.latent_image).toEqual(['6', 0]);
+    expect(wf['11'].inputs.sigmas).toEqual(['7', 0]);
+    expect(wf['7'].inputs.model).toEqual(['0', 0]);
+  });
+
+  it('borne le débruitage entre 0,05 et 1', () => {
+    const cfg = fluxPixelArtConfig();
+    expect(buildFlux2Img2ImgWorkflow(cfg, { prompt: 'x', seed: 0, initImage: 'a.png', denoise: 0 })['7'].inputs.denoise).toBe(0.05);
+    expect(buildFlux2Img2ImgWorkflow(cfg, { prompt: 'x', seed: 0, initImage: 'a.png', denoise: 5 })['7'].inputs.denoise).toBe(1);
+  });
+
+  it('fonctionne sans LoRA', () => {
+    const wf = buildFlux2Img2ImgWorkflow({ ...fluxPixelArtConfig(), lora: '' }, {
+      prompt: 'x', seed: 0, initImage: 'a.png', denoise: 0.6,
+    });
+    expect(wf['0']).toBeUndefined();
+    expect(wf['7'].inputs.model).toEqual(['1', 0]);
+  });
+
+  it('requiert les trois fichiers natifs et autorise un modèle sans LoRA', () => {
+    const cfg = fluxPixelArtConfig();
+    expect(localConfigError(cfg)).toBeNull();
+    expect(localConfigError({ ...cfg, textEncoder: '' })).toContain('Qwen');
+    const wf = buildComfyWorkflow({ ...cfg, lora: '' }, { prompt: 'x', seed: 0 });
+    expect(wf['0']).toBeUndefined();
+    expect(wf['6'].inputs.model).toEqual(['1', 0]);
+  });
+});
+
+describe('réponses ComfyUI actuelles', () => {
+  it('lit les enums historiques et le schéma COMBO actuel', () => {
+    expect(comfyChoices({ N: { input: { required: { f: [['euler', 'heun']] } } } }, 'N', 'f')).toEqual(['euler', 'heun']);
+    expect(comfyChoices({ N: { input: { required: { f: ['COMBO', { options: ['euler', 'heun'] }] } } } }, 'N', 'f')).toEqual(['euler', 'heun']);
+    expect(comfyChoices({}, 'N', 'f')).toEqual([]);
+  });
+
+  it('remonte une panne du modèle sans attendre le timeout', () => {
+    expect(parseComfyError({ p: { status: { status_str: 'error', messages: [['execution_error', { node_type: 'CLIPLoader', exception_message: 'out of memory' }]] } } }, 'p')).toContain('CLIPLoader');
+    expect(parseComfyError({ p: { status: { status_str: 'error', messages: [['execution_interrupted', {}]] } } }, 'p')).toContain('interrompue');
+    expect(parseComfyError({}, 'p')).toBeNull();
+    expect(parseComfyError({ p: { status: { status_str: 'success' } } }, 'p')).toBeNull();
   });
 });

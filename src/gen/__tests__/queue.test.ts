@@ -21,15 +21,17 @@ import {
   enqueueGeneration,
 } from '../queue';
 import type { GenerationSpec } from '../runner';
+import { defaultServerConfig } from '../localServer';
 
 const spec: GenerationSpec = {
   prompt: 'dragon',
-  engine: 'local',
+  engine: 'server',
   style: 'rpg',
   size: 32,
   motion: 'none',
   frameCount: 1,
   variations: 1,
+  server: defaultServerConfig(),
 };
 
 const flush = (): Promise<void> =>
@@ -84,7 +86,7 @@ describe('file d’attente de génération', () => {
     const results = useEditorStore.getState().genResults;
     expect(results.length).toBe(2);
     expect(results[0].prompt).toBe('dragon');
-    expect(results[0].engine).toBe('local');
+    expect(results[0].engine).toBe('server');
   });
 
   it('met à jour la progression pendant la génération', async () => {
@@ -95,7 +97,7 @@ describe('file d’attente de génération', () => {
         await new Promise<void>((resolve) => {
           release = resolve;
         });
-        return { prompt: 'dragon', engine: 'local', variations: [[]] };
+        return { prompt: 'dragon', engine: 'server', variations: [[]] };
       },
     );
 

@@ -2,21 +2,24 @@ import { useEffect, useRef, useState } from 'react';
 import type { PixelBuffer } from '../types';
 import { drawCheckerboard } from '../canvas/compositor';
 import { useEditorStore } from '../state/store';
-import { analyzePrompt, type ArtStyle, type Motion } from '../gen/prompt';
-import { PROMPT_EXAMPLES } from '../gen/procedural';
-import type { AiModelId } from '../gen/ai';
+import { analyzePrompt, buildAiPrompt, inferAssetKind, PROMPT_EXAMPLES, type AssetKind, type ArtStyle, type Motion, type PlView } from '../gen/prompt';
+import { AI_MODELS, DEFAULT_AI_MODEL, blobToRawImage, resolveAiModel, resolveAiQuality, type AiModelId, type AiQuality } from '../gen/ai';
+import type { PixelSampling } from '../gen/pixelate';
 import {
   defaultServerConfig,
+  fluxPixelArtConfig,
+  localConfigError,
+  loraMatchesFamily,
   DEFAULT_NEGATIVE_PROMPT,
-  DEFAULT_URLS,
   FALLBACK_SAMPLERS,
+  loraToken,
   SCHEDULERS,
   testLocalServer,
   type LocalEngineKind,
   type LocalServerConfig,
   type ServerStatus,
 } from '../gen/localServer';
-import { describeLoraTrigger, findLoraTrigger } from '../gen/loras';
+import { describeLoraTrigger, findLoraTrigger, withTriggerWords } from '../gen/loras';
 import {
   cancelAllGenerations,
   cancelGeneration,
@@ -28,9 +31,13 @@ const AI_KEY_STORAGE = 'pixelforge.aikey';
 const SERVER_STORAGE = 'pixelforge.server';
 const GEN_FORM_STORAGE = 'pixelforge.genform';
 
-type EngineId = 'local' | 'server' | 'ai';
+type EngineId = 'server' | 'ai';
+interface GeneratedExample { id: string; prompt: string }
+const EXAMPLE_LABELS: Record<string, string> = { dragon: 'Dragon bleu', knight: 'Chevalier doré', potion: 'Potion violette' };
+const SAMPLE_ROOT = `${import.meta.env.BASE_URL}generation-samples/`;
 
 interface GenForm {
+  pipelineVersion?: number;
   prompt: string;
   styleChoice: ArtStyle | 'auto';
   size: number;
@@ -40,24 +47,52 @@ interface GenForm {
   engine: EngineId;
   aiModel: AiModelId;
   useDocPalette: boolean;
+  aiQuality: AiQuality;
+  assetChoice: AssetKind | 'auto';
+  backgroundChoice: 'auto' | 'transparent' | 'keep';
+  maxColors: number;
+  sampling: PixelSampling;
+  seed: string;
+  /** Vue/cadrage imposé au modèle. */
+  viewChoice: PlView | 'auto';
+  /** Stabilité de l'animation (taux de débruitage img2img). */
+  animDenoise: number;
 }
 
 function loadGenForm(): GenForm {
   const defaults: GenForm = {
     prompt: 'un petit dragon bleu avec des ailes',
     styleChoice: 'auto',
-    size: 32,
+    size: 128,
     motion: 'none',
     frameCount: 4,
-    variations: 2,
-    engine: 'local',
-    aiModel: 'gpt-image-1',
+    variations: 1,
+    engine: 'server',
+    pipelineVersion: 4,
+    aiModel: DEFAULT_AI_MODEL,
     useDocPalette: false,
+    aiQuality: 'high',
+    assetChoice: 'auto',
+    backgroundChoice: 'auto',
+    maxColors: 48,
+    sampling: 'dominant',
+    seed: '',
+    viewChoice: 'auto',
+    animDenoise: 0.62,
   };
   try {
     const saved = window.localStorage.getItem(GEN_FORM_STORAGE);
     if (saved) {
-      return { ...defaults, ...(JSON.parse(saved) as Partial<GenForm>) };
+      const savedForm = JSON.parse(saved) as Partial<GenForm> & { engine?: string };
+      const form = { ...defaults, ...savedForm };
+      // Les anciens moteurs (procédural, PixelLab) ont été retirés.
+      if (form.engine !== 'server' && form.engine !== 'ai') {
+        form.engine = 'server';
+        if (savedForm.size === 32) form.size = 128;
+      }
+      form.aiModel = resolveAiModel(form.aiModel);
+      form.aiQuality = resolveAiQuality(form.aiModel, form.aiQuality);
+      return form;
     }
   } catch {
     // valeurs par défaut
@@ -66,9 +101,14 @@ function loadGenForm(): GenForm {
 }
 
 const ENGINE_LABELS: Record<EngineId, string> = {
-  local: 'Local',
   server: 'Serveur local',
   ai: 'IA en ligne',
+};
+
+const VIEW_LABELS: Record<PlView, string> = {
+  'high top-down': 'Top-down haute (vu de dessus)',
+  'low top-down': 'Top-down basse (3/4)',
+  side: 'Côté (plateforme)',
 };
 
 const JOB_STATUS_LABELS: Record<GenJob['status'], string> = {
@@ -135,15 +175,39 @@ const STYLES: { id: ArtStyle | 'auto'; label: string }[] = [
   { id: 'cartoon', label: 'Cartoon mignon' },
 ];
 
+/**
+ * Anciens noms de fichiers du profil FLUX.2 Klein, remplacés par les
+ * modèles réellement installés sur cette machine (GGUF 9B + Qwen 3 8B).
+ * Une configuration enregistrée avant ce changement doit être migrée,
+ * sinon ComfyUI refuse le workflow.
+ */
+const OBSOLETE_KLEIN_FILES: Record<string, string> = {
+  'flux-2-klein-4b-fp8.safetensors': 'flux-2-klein-9b-Q4_K_S.gguf',
+  'qwen_3_4b_fp4_flux2.safetensors': 'qwen_3_8b_fp8mixed.safetensors',
+  'limbicnation-pixel-art-flux2-klein.safetensors': 'klein-spritesheet-lora.safetensors',
+};
+
 function loadServerConfig(): LocalServerConfig {
   try {
     const saved = window.localStorage.getItem(SERVER_STORAGE);
     if (saved) {
       const parsed = JSON.parse(saved) as Partial<LocalServerConfig>;
+      // Upgrade the old bundled SD 1.5/default setup; retain custom server setups.
+      if (!parsed.modelFamily && (!parsed.checkpoint || parsed.checkpoint === 'v1-5-pruned-emaonly.safetensors') &&
+        (!parsed.lora || /PixelArtRedmond/i.test(parsed.lora))) return fluxPixelArtConfig();
       const merged = {
         ...defaultServerConfig(parsed.engine ?? 'a1111'),
         ...parsed,
       };
+      // Migre les fichiers du profil Klein vers ceux installés localement.
+      if (merged.modelFamily === 'flux2-klein') {
+        for (const key of ['diffusionModel', 'textEncoder', 'vae', 'lora'] as const) {
+          const replacement = OBSOLETE_KLEIN_FILES[merged[key] ?? ''];
+          if (replacement) merged[key] = replacement;
+        }
+        // La LoRA de spritesheets Klein n'a pas de mot-déclencheur connu.
+        if (merged.lora === 'klein-spritesheet-lora.safetensors') merged.triggerWords = '';
+      }
       // Complète les mots-déclencheurs des configurations enregistrées
       // avant l'arrivée de cette fonctionnalité.
       if (merged.lora.trim() && !merged.triggerWords.trim()) {
@@ -154,7 +218,7 @@ function loadServerConfig(): LocalServerConfig {
   } catch {
     // configuration illisible : valeurs par défaut
   }
-  return defaultServerConfig('a1111');
+  return fluxPixelArtConfig();
 }
 
 export function GenPanel() {
@@ -184,10 +248,32 @@ export function GenPanel() {
   });
   const [aiModel, setAiModel] = useState<AiModelId>(initial.aiModel);
   const [useDocPalette, setUseDocPalette] = useState(initial.useDocPalette);
+  const [aiQuality, setAiQuality] = useState<AiQuality>(initial.aiQuality);
+  const [assetChoice, setAssetChoice] = useState<AssetKind | 'auto'>(initial.assetChoice);
+  const [backgroundChoice, setBackgroundChoice] = useState(initial.backgroundChoice);
+  const [maxColors, setMaxColors] = useState(initial.maxColors);
+  const [sampling, setSampling] = useState<PixelSampling>(initial.sampling);
+  const [seed, setSeed] = useState(initial.seed);
+  const [viewChoice, setViewChoice] = useState<PlView | 'auto'>(initial.viewChoice);
+  const [animDenoise, setAnimDenoise] = useState(initial.animDenoise);
   const [server, setServer] = useState<LocalServerConfig>(loadServerConfig);
+  const isFlux = server.engine === 'comfyui' && server.modelFamily === 'flux2-klein';
   const [serverStatus, setServerStatus] = useState<ServerStatus | null>(null);
   const [testing, setTesting] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
+  const [examples, setExamples] = useState<GeneratedExample[]>([]);
+  const resolvedStyle = styleChoice === 'auto' ? analyzePrompt(prompt).style : styleChoice;
+  const assetKind = assetChoice === 'auto' ? inferAssetKind(prompt) : assetChoice;
+  const transparentBackground = backgroundChoice === 'auto'
+    ? assetKind === 'sprite' : backgroundChoice === 'transparent';
+  const colorBudget = resolvedStyle === 'gameboy' ? 4 : resolvedStyle === 'nes' ? 16 : maxColors;
+  const effectiveView: PlView | undefined = viewChoice === 'auto' ? undefined : viewChoice;
+  const effectivePrompt = buildAiPrompt(prompt, resolvedStyle, motion, 0, motion === 'none' ? 1 : Math.min(frameCount, 4), {
+    size, maxColors: colorBudget, assetKind, transparentBackground, view: effectiveView, provider: engine === 'server' ? isFlux ? 'flux2' : 'server' : 'ai',
+  });
+  const submittedPrompt = engine === 'server'
+    ? (withTriggerWords(effectivePrompt, server.triggerWords) + (server.engine === 'a1111' ? loraToken(server.lora, server.loraWeight) : '')).trim()
+    : effectivePrompt;
 
   const activeCount = jobs.filter(
     (job) => job.status === 'queued' || job.status === 'running',
@@ -217,6 +303,8 @@ export function GenPanel() {
           engine,
           aiModel,
           useDocPalette,
+          aiQuality, assetChoice, backgroundChoice, maxColors, sampling, seed, viewChoice, animDenoise,
+          pipelineVersion: 4,
         }),
       );
     } catch {
@@ -232,6 +320,7 @@ export function GenPanel() {
     engine,
     aiModel,
     useDocPalette,
+    aiQuality, assetChoice, backgroundChoice, maxColors, sampling, seed, viewChoice, animDenoise,
   ]);
 
   const saveKey = (value: string): void => {
@@ -246,6 +335,38 @@ export function GenPanel() {
   const patchServer = (patch: Partial<LocalServerConfig>): void => {
     setServer((prev) => ({ ...prev, ...patch }));
   };
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void fetch(`${SAMPLE_ROOT}validation.json`, { signal: controller.signal }).then(async (response) => {
+      if (!response.ok) return;
+      const report = await response.json() as { cases?: GeneratedExample[] };
+      if (!controller.signal.aborted && Array.isArray(report.cases)) {
+        setExamples(report.cases.filter((sample) => sample && Object.hasOwn(EXAMPLE_LABELS, sample.id) && typeof sample.prompt === 'string'));
+      }
+    }).catch(() => { /* Les exemples sont facultatifs dans un déploiement personnalisé. */ });
+    return () => controller.abort();
+  }, []);
+
+  const openExample = async (sample: GeneratedExample): Promise<void> => {
+    try {
+      const response = await fetch(`${SAMPLE_ROOT}${sample.id}-128.png`);
+      if (!response.ok) throw new Error('Exemple introuvable.');
+      const raw = await blobToRawImage(await response.blob());
+      newDocFromBuffers(sample.prompt, [{ ...raw, data: new Uint8ClampedArray(raw.data) }]);
+    } catch (error) {
+      setFormError(error instanceof Error ? error.message : 'Impossible d’ouvrir le sprite.');
+    }
+  };
+
+  useEffect(() => {
+    if (engine !== 'server') return;
+    let active = true;
+    const timer = window.setTimeout(() => {
+      void testLocalServer(server).then((status) => { if (active) setServerStatus(status); });
+    }, 350);
+    return () => { active = false; window.clearTimeout(timer); };
+  }, [engine, server]);
 
   /**
    * Change la LoRA et met à jour les mots-déclencheurs : détectés
@@ -267,19 +388,20 @@ export function GenPanel() {
   const testConnection = async (): Promise<void> => {
     setTesting(true);
     setFormError(null);
+
     const status = await testLocalServer(server);
     setServerStatus(status);
     setTesting(false);
     if (!status.ok) return;
     const patch: Partial<LocalServerConfig> = {};
     if (server.engine === 'comfyui') {
-      if (status.models.length > 0 && !status.models.includes(server.checkpoint)) {
+      if (!isFlux && status.models.length > 0 && !status.models.includes(server.checkpoint)) {
         patch.checkpoint = status.models[0];
       }
       if (status.samplers.length > 0 && !status.samplers.includes(server.sampler)) {
         patch.sampler = status.samplers[0];
       }
-      if (server.lora.trim() && !status.loras.includes(server.lora.trim())) {
+      if (!isFlux && server.lora.trim() && !status.loras.includes(server.lora.trim())) {
         patch.lora = '';
       }
     } else if (!FALLBACK_SAMPLERS.a1111.includes(server.sampler)) {
@@ -293,6 +415,11 @@ export function GenPanel() {
     if (!text) return;
     setFormError(null);
 
+    if (engine !== 'ai' && seed.trim() && (!Number.isSafeInteger(Number(seed)) || Number(seed) < 0 || Number(seed) > 1_000_000_000)) {
+      setFormError('La graine doit être un entier entre 0 et 1 000 000 000.');
+      return;
+    }
+
     if (engine === 'ai' && !apiKey.trim()) {
       setFormError('Renseignez votre clé API pour le moteur « IA en ligne ».');
       return;
@@ -302,10 +429,9 @@ export function GenPanel() {
         setFormError('Renseignez l’URL du serveur local.');
         return;
       }
-      if (server.engine === 'comfyui' && !server.checkpoint.trim()) {
-        setFormError(
-          'Choisissez un checkpoint ComfyUI (bouton « Tester la connexion »).',
-        );
+      const configError = localConfigError(server);
+      if (configError) {
+        setFormError(configError);
         return;
       }
     }
@@ -321,25 +447,31 @@ export function GenPanel() {
       motion,
       frameCount,
       variations,
+      assetKind,
+      transparentBackground,
+      view: effectiveView,
+      animDenoise,
+      maxColors,
+      sampling,
+      seed: engine !== 'ai' && seed.trim() ? Number(seed) : undefined,
       palette:
-        engine !== 'local' && useDocPalette
-          ? useEditorStore.getState().doc.palette
-          : undefined,
+        useDocPalette ? useEditorStore.getState().doc.palette : undefined,
       server: engine === 'server' ? server : undefined,
-      ai: engine === 'ai' ? { apiKey, model: aiModel } : undefined,
+      ai: engine === 'ai' ? { apiKey, model: aiModel, quality: aiQuality } : undefined,
     });
   };
 
   return (
     <section className="panel gen-panel">
-      <div className="panel-title">Générer un sprite</div>
+      <div className="panel-title">Générer du pixel art</div>
 
       <div className="gen-prompt">
         <textarea
           value={prompt}
           rows={3}
           spellCheck={false}
-          placeholder="Décrivez votre sprite… ex : chevalier en armure dorée"
+          aria-label="Description du pixel art"
+          placeholder="Sujet, couleurs, accessoires, pose, vue… ex : chevalier en armure dorée, épée bleue, vue de face"
           onChange={(e) => setPrompt(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) void generate();
@@ -401,6 +533,8 @@ export function GenPanel() {
             <option value={32}>32 × 32</option>
             <option value={48}>48 × 48</option>
             <option value={64}>64 × 64</option>
+            <option value={128}>128 × 128 (détaillé)</option>
+            <option value={256}>256 × 256 (illustration)</option>
           </select>
         </label>
         <label className="field grow">
@@ -453,11 +587,94 @@ export function GenPanel() {
           value={engine}
           onChange={(e) => setEngine(e.target.value as EngineId)}
         >
-          <option value="local">Générateur local (hors-ligne, gratuit)</option>
           <option value="server">Serveur IA local (ComfyUI / A1111)</option>
           <option value="ai">IA en ligne (clé API requise)</option>
         </select>
       </label>
+
+      {engine !== 'ai' && (
+        <>
+          <label className="field">
+            <span>Format du résultat</span>
+            <select value={assetChoice} onChange={(e) => setAssetChoice(e.target.value as AssetKind | 'auto')}>
+              <option value="auto">Auto : {assetKind === 'sprite' ? 'sprite isolé' : assetKind === 'scene' ? 'scène complète' : 'tuile de terrain'}</option>
+              <option value="sprite">Sprite isolé</option>
+              <option value="scene">Scène / illustration (avec décor)</option>
+              <option value="tile">Tuile de terrain</option>
+            </select>
+          </label>
+          <label className="field">
+            <span>Vue</span>
+            <select value={viewChoice} onChange={(e) => setViewChoice(e.target.value as PlView | 'auto')}>
+              <option value="auto">Auto : {assetKind === 'tile' ? 'top-down haute' : 'top-down basse'}</option>
+              {(Object.keys(VIEW_LABELS) as PlView[]).map((view) => (
+                <option key={view} value={view}>{VIEW_LABELS[view]}</option>
+              ))}
+            </select>
+          </label>
+          <label className="field">
+            <span>Fond</span>
+            <select value={backgroundChoice} onChange={(e) => setBackgroundChoice(e.target.value as GenForm['backgroundChoice'])}>
+              <option value="auto">Auto : {transparentBackground ? 'transparent' : 'conservé'}</option>
+              <option value="transparent">Transparent (détourage)</option>
+              <option value="keep">Conserver le fond</option>
+            </select>
+          </label>
+          {transparentBackground && <div className="hint">Le fond uni et les franges claires sont retirés automatiquement ; les reflets à l’intérieur du sprite sont conservés.</div>}
+          <div className="row gap">
+            <label className="field grow">
+              <span>Couleurs max.</span>
+              <select value={colorBudget} disabled={resolvedStyle === 'gameboy' || resolvedStyle === 'nes' || useDocPalette} onChange={(e) => setMaxColors(Number(e.target.value))}>
+                {[4, 16, 24, 32, 48, 64].map((value) => <option key={value} value={value}>{value}</option>)}
+              </select>
+            </label>
+            <label className="field grow">
+              <span>Réduction</span>
+              <select value={sampling} onChange={(e) => setSampling(e.target.value as PixelSampling)}>
+                <option value="dominant">Pixels nets</option>
+                <option value="average">Couleurs moyennes</option>
+              </select>
+            </label>
+          </div>
+          <div className="hint">64 à 128 px et 32 à 48 couleurs permettent de garder davantage de détails. Une palette imposée peut modifier les couleurs du prompt.</div>
+          {motion !== 'none' && engine === 'server' && (
+            <label className="field">
+              <span>Stabilité de l’animation : {Math.round(animDenoise * 100)} %</span>
+              <input
+                className="slider"
+                type="range"
+                min={0.3}
+                max={0.95}
+                step={0.05}
+                value={animDenoise}
+                onChange={(e) => setAnimDenoise(Number(e.target.value))}
+              />
+              <span className="hint">
+                {animDenoise <= 0.5
+                  ? 'Poses subtiles, personnage très stable — idéal pour un repos.'
+                  : animDenoise <= 0.75
+                    ? 'Bon équilibre entre mouvement et stabilité — marche, attaque.'
+                    : 'Poses très marquées, mais l’identité du personnage peut dériver.'}
+              </span>
+            </label>
+          )}
+          {motion !== 'none' && <div className="hint">
+            {engine === 'server'
+              ? 'Animation par img2img séquentiel : la première image est créée, puis chaque pose est générée depuis la précédente. Le personnage garde son identité et son alignement.'
+              : 'Animation IA : jusqu’à 4 images générées séparément. L’identité et l’alignement peuvent varier entre les poses.'}
+          </div>}
+          <details className="gen-prompt-preview">
+            <summary>Voir le prompt envoyé au moteur</summary>
+            <pre>{submittedPrompt}</pre>
+            {engine === 'server' && !isFlux && <><span>Prompt négatif</span><pre>{server.negativePrompt}</pre></>}
+          </details>
+        </>
+      )}
+
+      {engine !== 'ai' && <label className="field">
+        <span>Graine (vide = aléatoire)</span>
+        <input type="number" min={0} max={1_000_000_000} step={1} value={seed} placeholder="Ex. 42, pour reproduire le résultat" onChange={(e) => setSeed(e.target.value)} />
+      </label>}
 
       {engine === 'server' && (
         <div className="server-box">
@@ -468,20 +685,33 @@ export function GenPanel() {
               onChange={(e) => {
                 const kind = e.target.value as LocalEngineKind;
                 setServerStatus(null);
-                setServer({
-                  ...server,
-                  engine: kind,
-                  baseUrl: DEFAULT_URLS[kind],
-                  sampler: FALLBACK_SAMPLERS[kind][0],
-                  checkpoint: kind === 'comfyui' ? server.checkpoint : '',
-                  lora: '',
-                });
+                setServer(kind === 'comfyui' ? fluxPixelArtConfig() : defaultServerConfig(kind));
               }}
             >
               <option value="a1111">Automatic1111 / Forge</option>
               <option value="comfyui">ComfyUI</option>
             </select>
           </label>
+
+          {server.engine === 'comfyui' && <>
+            <label className="field">
+              <span>Profil du modèle</span>
+              <select value={server.modelFamily ?? 'sd'} onChange={(e) => {
+                setServerStatus(null);
+                setServer(e.target.value === 'flux2-klein'
+                  ? { ...fluxPixelArtConfig(), baseUrl: server.baseUrl }
+                  : { ...defaultServerConfig('comfyui'), baseUrl: server.baseUrl, modelFamily: 'sd' });
+              }}>
+                <option value="flux2-klein">FLUX.2 Klein — pixel art (recommandé)</option>
+                <option value="sd">Stable Diffusion / SDXL — configuration manuelle</option>
+              </select>
+            </label>
+            {isFlux && <div className="gen-guidance">
+              <strong>FLUX.2 Klein + LoRA de sprites</strong>
+              <p>Modèle ouvert sous Apache 2.0. Le profil utilise 4 étapes, Euler et une résolution adaptée à la taille du sprite. Le chargement prend quelques secondes sur une carte de 12 Go.</p>
+              <p>Si des fichiers manquent, testez la connexion : elle indique précisément lesquels.</p>
+            </div>}
+          </>}
 
           <label className="field">
             <span>URL du serveur</span>
@@ -507,7 +737,7 @@ export function GenPanel() {
                 className={`server-status ${serverStatus.ok ? 'ok' : 'ko'}`}
                 title={serverStatus.message}
               >
-                {serverStatus.ok ? '● connecté' : '● hors ligne'}
+                {serverStatus.ok ? '● prêt' : '● à configurer'}
               </span>
             )}
           </div>
@@ -530,6 +760,18 @@ export function GenPanel() {
 
           {server.engine === 'comfyui' && (
             <>
+              {isFlux ? <>
+                {([
+                  ['diffusionModel', 'Modèle FLUX.2', serverStatus?.diffusionModels],
+                  ['textEncoder', 'Encodeur Qwen', serverStatus?.textEncoders],
+                  ['vae', 'VAE FLUX.2', serverStatus?.vaes],
+                ] as const).map(([key, label, files]) => <label key={key} className="field">
+                  <span>{label}</span>
+                  <select value={server[key] ?? ''} onChange={(e) => patchServer({ [key]: e.target.value })}>
+                    {Array.from(new Set([server[key] ?? '', ...(files ?? [])])).filter(Boolean).map((file) => <option key={file} value={file}>{file}</option>)}
+                  </select>
+                </label>)}
+              </> :
               <label className="field">
                 <span>Checkpoint</span>
                 <select
@@ -548,6 +790,7 @@ export function GenPanel() {
                     ))}
                 </select>
               </label>
+              }
 
               <div className="row gap">
                 <label className="field grow">
@@ -568,10 +811,11 @@ export function GenPanel() {
                 <label className="field grow">
                   <span>Planificateur</span>
                   <select
-                    value={server.scheduler}
+                    value={isFlux ? 'flux2' : server.scheduler}
+                    disabled={isFlux}
                     onChange={(e) => patchServer({ scheduler: e.target.value })}
                   >
-                    {(serverStatus?.schedulers ?? SCHEDULERS).map((s) => (
+                    {(isFlux ? ['flux2'] : serverStatus?.schedulers ?? SCHEDULERS).map((s) => (
                       <option key={s} value={s}>
                         {s}
                       </option>
@@ -588,7 +832,7 @@ export function GenPanel() {
                     onChange={(e) => applyLora(e.target.value)}
                   >
                     <option value="">— aucune —</option>
-                    {(serverStatus?.loras ?? []).map((lora) => (
+                    {Array.from(new Set([server.lora, ...(serverStatus?.loras ?? [])])).filter((lora) => lora && loraMatchesFamily(lora, server.modelFamily)).map((lora) => (
                       <option key={lora} value={lora}>
                         {lora}
                       </option>
@@ -666,7 +910,7 @@ export function GenPanel() {
             </div>
           )}
 
-          <label className="field">
+          {!isFlux && <label className="field">
             <span>Prompt négatif</span>
             <textarea
               rows={2}
@@ -675,7 +919,7 @@ export function GenPanel() {
               placeholder={DEFAULT_NEGATIVE_PROMPT}
               onChange={(e) => patchServer({ negativePrompt: e.target.value })}
             />
-          </label>
+          </label>}
 
           <div className="row gap">
             <label className="field grow">
@@ -684,7 +928,7 @@ export function GenPanel() {
                 className="slider"
                 type="range"
                 min={4}
-                max={60}
+                max={isFlux ? 8 : 60}
                 value={server.steps}
                 onChange={(e) => patchServer({ steps: Number(e.target.value) })}
               />
@@ -697,6 +941,7 @@ export function GenPanel() {
                 max={20}
                 step={0.5}
                 value={server.cfgScale}
+                disabled={isFlux}
                 onChange={(e) => patchServer({ cfgScale: Number(e.target.value) })}
               />
             </label>
@@ -710,7 +955,7 @@ export function GenPanel() {
                 patchServer({ resolution: Number(e.target.value) })
               }
             >
-              <option value={512}>512 × 512 (SD 1.5)</option>
+              <option value={512}>512 × 512 {isFlux ? '(sprites, recommandé)' : '(SD 1.5)'}</option>
               <option value={768}>768 × 768</option>
               <option value={1024}>1024 × 1024 (SDXL / Flux)</option>
             </select>
@@ -734,8 +979,7 @@ export function GenPanel() {
                 : 'python main.py --enable-cors-header'}
             </code>
             <br />
-            Astuce : chargez un modèle pixel art (ex. <em>pixel-art-xl</em>,
-            <em> PixelArt-Diffusion</em>) ou ajoutez une LoRA pour un rendu net.
+            {isFlux ? 'Le fond uni du sprite est retiré par PixelForge après génération.' : 'Chargez un modèle pixel art ou une LoRA compatible avec votre checkpoint.'}
           </div>
         </div>
       )}
@@ -756,13 +1000,28 @@ export function GenPanel() {
             <span>Modèle</span>
             <select
               value={aiModel}
-              onChange={(e) => setAiModel(e.target.value as AiModelId)}
+              onChange={(e) => {
+                const model = resolveAiModel(e.target.value);
+                setAiModel(model);
+                setAiQuality((quality) => resolveAiQuality(model, quality));
+              }}
             >
-              <option value="gpt-image-1">gpt-image-1 (recommandé)</option>
-              <option value="gpt-image-1-mini">gpt-image-1-mini (rapide)</option>
-              <option value="dall-e-3">dall-e-3</option>
+              {AI_MODELS.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}
             </select>
           </label>
+          <label className="field">
+            <span>Qualité IA</span>
+            <select value={aiQuality} onChange={(e) => setAiQuality(e.target.value as AiQuality)}>
+              <option value="low">Brouillon (rapide)</option>
+              <option value="medium">Équilibrée</option>
+              <option value="high">Haute</option>
+              {AI_MODELS.find((model) => model.id === aiModel)?.extendedQuality && <>
+                <option value="xhigh">Très haute</option>
+                <option value="max">Maximale</option>
+              </>}
+            </select>
+          </label>
+          <div className="hint">Chaque image utilise votre quota API. Une qualité plus élevée peut augmenter le coût et le temps de génération.</div>
           <label className="check-row">
             <input
               type="checkbox"
@@ -775,6 +1034,21 @@ export function GenPanel() {
       )}
 
       {formError && <div className="gen-error">{formError}</div>}
+
+      {examples.length > 0 && <details className="gen-examples">
+        <summary>Exemples générés avec FLUX.2 Klein</summary>
+        <div className="hint">Sprites de 128 px avec fond transparent. Ouvrez-les pour les modifier ou reprenez leur description.</div>
+        <div className="result-grid">
+          {examples.map((sample) => <div className="result-card" key={sample.id}>
+            <img className="sample-preview" src={`${SAMPLE_ROOT}${sample.id}-128.png`} alt={sample.prompt} width={128} height={128} loading="lazy" />
+            <div className="result-meta">{EXAMPLE_LABELS[sample.id]}</div>
+            <div className="result-actions">
+              <button className="small" type="button" onClick={() => void openExample(sample)}>Ouvrir</button>
+              <button className="small" type="button" onClick={() => setPrompt(sample.prompt)}>Prompt</button>
+            </div>
+          </div>)}
+        </div>
+      </details>}
 
       {jobs.length > 0 && (
         <>
